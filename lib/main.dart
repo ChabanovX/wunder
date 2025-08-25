@@ -62,11 +62,13 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   Future<void> _createPeer({bool withMic = true, bool withCam = false}) async {
     final config = {
       'iceServers': [
-        // Для одной Wi-Fi сети можно пусто; для интернета добавь STUN/TURN
-        // {'urls': 'stun:stun.l.google.com:19302'},
+        {'urls': 'stun:stun.l.google.com:19302'},
       ],
       'sdpSemantics': 'unified-plan',
+      'iceTransportPolicy': 'all',
+      'bundlePolicy': 'max-bundle',
     };
+
     final constraints = {
       'mandatory': {},
       'optional': [
@@ -107,11 +109,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
           'noiseSuppression': true,
           'autoGainControl': true,
         },
-        'video': withCam
-            ? {
-                'facingMode': 'user',
-              }
-            : false,
+        'video': withCam ? {'facingMode': 'user'} : false,
       });
 
       _localStream = media;
@@ -124,8 +122,10 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
       for (final t in media.getTracks()) {
         await pc.addTrack(t, media);
       }
-      _logLine('Local tracks added: '
-          '${withMic ? 'audio ' : ''}${withCam ? 'video' : ''}');
+      _logLine(
+        'Local tracks added: '
+        '${withMic ? 'audio ' : ''}${withCam ? 'video' : ''}',
+      );
 
       if (Platform.isAndroid || Platform.isIOS) {
         await Helper.setSpeakerphoneOn(true);
@@ -150,7 +150,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     await _pc!.setLocalDescription(offer);
 
     // Соберём ICE в SDP для ручного обмена
-    await Future.delayed(const Duration(seconds: 1));
+    await Future.delayed(const Duration(seconds: 5));
 
     final local = await _pc!.getLocalDescription();
     _localSdpCtrl.text = jsonEncode({'type': local!.type, 'sdp': local.sdp});
@@ -166,7 +166,10 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     final txt = _remoteSdpCtrl.text.trim();
     if (txt.isEmpty || _pc == null) return;
     final map = jsonDecode(txt) as Map<String, dynamic>;
-    final desc = RTCSessionDescription(map['sdp'] as String, map['type'] as String);
+    final desc = RTCSessionDescription(
+      map['sdp'] as String,
+      map['type'] as String,
+    );
 
     await _pc!.setRemoteDescription(desc);
     _logLine('Remote SDP set: ${desc.type}');
@@ -218,7 +221,10 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   Future<void> _startMic() async {
     if (_pc == null) return;
-    final s = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+    final s = await navigator.mediaDevices.getUserMedia({
+      'audio': true,
+      'video': false,
+    });
     final track = s.getAudioTracks().first;
     await _pc!.addTrack(track, s);
     if (_localStream == null) {
@@ -248,7 +254,10 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   Future<void> _startCam() async {
     if (_pc == null) return;
-    final s = await navigator.mediaDevices.getUserMedia({'audio': false, 'video': true});
+    final s = await navigator.mediaDevices.getUserMedia({
+      'audio': false,
+      'video': true,
+    });
     final track = s.getVideoTracks().first;
     await _pc!.addTrack(track, s);
     if (_localStream == null) {
@@ -398,7 +407,9 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                 Expanded(
                   child: TextField(
                     controller: _chatCtrl,
-                    decoration: const InputDecoration(hintText: 'Type message…'),
+                    decoration: const InputDecoration(
+                      hintText: 'Type message…',
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),
