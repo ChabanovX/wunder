@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:io' show Platform;
+import 'dart:io' show Platform, WebSocket;
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
@@ -15,25 +15,28 @@ class WebRTCDemo extends StatefulWidget {
 }
 
 class _WebRTCDemoState extends State<WebRTCDemo> {
+  // ---------- configurable ----------
+  static const String _serverUrl = 'ws://208.123.185.205:8080';
+  // ----------------------------------
+
   RTCPeerConnection? _pc;
   RTCDataChannel? _dc;
+  WebSocket? _ws;
 
   MediaStream? _localStream;
 
-  // Video renderers
   final _localRenderer = RTCVideoRenderer();
   final _remoteRenderer = RTCVideoRenderer();
 
-  // UI / state
   bool _micOn = false;
   bool _camOn = false;
   bool _muted = false;
 
-  // Text controllers
-  final _localSdpCtrl = TextEditingController();
-  final _remoteSdpCtrl = TextEditingController();
+  // UI
+  final _roomCtrl = TextEditingController(); // для join по roomId/ссылке
   final _chatCtrl = TextEditingController();
 
+  String? _roomId;
   final _log = <String>[];
   void _logLine(String s) => setState(() => _log.add(s));
 
@@ -51,18 +54,100 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     _localStream?.dispose();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
-    _localSdpCtrl.dispose();
-    _remoteSdpCtrl.dispose();
+    _roomCtrl.dispose();
     _chatCtrl.dispose();
+    _ws?.close();
     super.dispose();
   }
 
-  // ---- Peer & media ----
+  // --------------------- WebSocket signaling ---------------------
+
+  Future<void> _connectWS() async {
+    if (_ws != null) return;
+    _logLine('Connecting WS to $_serverUrl …');
+    _ws = await WebSocket.connect(_serverUrl);
+    _ws!.listen(_onWSMessage, onDone: () {
+      _logLine('WS closed');
+      _ws = null;
+    }, onError: (e) {
+      _logLine('WS error: $e');
+      _ws = null;
+    });
+    _logLine('WS connected');
+  }
+
+  void _sendWS(Map<String, dynamic> m) {
+    final s = jsonEncode(m);
+    _ws?.add(s);
+  }
+
+  Future<void> _onWSMessage(dynamic data) async {
+    final msg = jsonDecode(data as String) as Map<String, dynamic>;
+    final type = msg['type'] as String?;
+
+    switch (type) {
+      case 'created': // {type:'created', roomId:'...'}
+        _roomId = msg['roomId'] as String?;
+        _logLine('Room created: $_roomId');
+        _logLine('Share link: webrtc://208.123.185.205/$_roomId  (или просто id)');
+        setState(() {});
+        break;
+
+      case 'offer': // {type:'offer', sdp:'...'}
+        if (_pc == null) {
+          await _createPeer(withMic: true, withCam: false);
+        }
+        await _pc!.setRemoteDescription(
+          RTCSessionDescription(msg['sdp'] as String, 'offer'),
+        );
+        _logLine('Remote OFFER set');
+
+        final answer = await _pc!.createAnswer({
+          'offerToReceiveAudio': true,
+          'offerToReceiveVideo': true,
+        });
+        await _pc!.setLocalDescription(answer);
+        final local = await _pc!.getLocalDescription();
+        _sendWS({'type': 'answer', 'sdp': local!.sdp});
+        _logLine('ANSWER sent');
+        break;
+
+      case 'answer': // {type:'answer', sdp:'...'}
+        if (_pc == null) return;
+        await _pc!.setRemoteDescription(
+          RTCSessionDescription(msg['sdp'] as String, 'answer'),
+        );
+        _logLine('Remote ANSWER set');
+        break;
+
+      case 'ice': // {type:'ice', candidate:{candidate, sdpMid, sdpMLineIndex}}
+        if (_pc == null) return;
+        final c = msg['candidate'] as Map<String, dynamic>;
+        await _pc!.addCandidate(
+          RTCIceCandidate(
+            c['candidate'] as String?,
+            c['sdpMid'] as String?,
+            c['sdpMLineIndex'] as int?,
+          ),
+        );
+        break;
+
+      case 'joined': // опционально, если сервер шлёт подтверждение join
+        _logLine('Joined room ${msg['roomId']}');
+        break;
+
+      default:
+        _logLine('WS << ${data.toString()}');
+    }
+  }
+
+  // --------------------- Peer & media ---------------------
 
   Future<void> _createPeer({bool withMic = true, bool withCam = false}) async {
     final config = {
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
+        // Если добавишь TURN — допиши сюда
       ],
       'sdpSemantics': 'unified-plan',
       'iceTransportPolicy': 'all',
@@ -95,7 +180,17 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     };
 
     pc.onIceCandidate = (cand) {
-      _logLine('ICE: ${cand.candidate?.substring(0, 30)}…');
+      if (cand.candidate != null) {
+        _sendWS({
+          'type': 'ice',
+          'candidate': {
+            'candidate': cand.candidate,
+            'sdpMid': cand.sdpMid,
+            'sdpMLineIndex': cand.sdpMLineIndex,
+
+          }
+        });
+      }
     };
 
     pc.onConnectionState = (state) {
@@ -122,10 +217,8 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
       for (final t in media.getTracks()) {
         await pc.addTrack(t, media);
       }
-      _logLine(
-        'Local tracks added: '
-        '${withMic ? 'audio ' : ''}${withCam ? 'video' : ''}',
-      );
+      _logLine('Local tracks added: '
+          '${withMic ? 'audio ' : ''}${withCam ? 'video' : ''}');
 
       if (Platform.isAndroid || Platform.isIOS) {
         await Helper.setSpeakerphoneOn(true);
@@ -134,13 +227,17 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     }
   }
 
-  Future<void> _makeOffer({bool withMic = true, bool withCam = false}) async {
+  // ---------- Offerer: create room + send offer via WS ----------
+  Future<void> _createRoomAndOffer({bool withMic = true, bool withCam = false}) async {
+    await _connectWS();
+
+    // запрос на создание комнаты
+    _sendWS({'type': 'create'});
+
     await _createPeer(withMic: withMic, withCam: withCam);
 
-    _dc = await _pc!.createDataChannel(
-      'chat',
-      RTCDataChannelInit()..ordered = true,
-    );
+    // создаём DC сами (offerer)
+    _dc = await _pc!.createDataChannel('chat', RTCDataChannelInit()..ordered = true);
     _wireDataChannel();
 
     final offer = await _pc!.createOffer({
@@ -148,46 +245,48 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
       'offerToReceiveVideo': true,
     });
     await _pc!.setLocalDescription(offer);
-
-    // Соберём ICE в SDP для ручного обмена
-    await Future.delayed(const Duration(seconds: 5));
-
     final local = await _pc!.getLocalDescription();
-    _localSdpCtrl.text = jsonEncode({'type': local!.type, 'sdp': local.sdp});
-    _logLine('Offer created. Share Local SDP with peer.');
+
+    // Отправляем оффер
+    _sendWS({'type': 'offer', 'sdp': local!.sdp});
+    _logLine('OFFER sent via WS');
   }
 
-  Future<void> _beAnswerer({bool withMic = true, bool withCam = false}) async {
-    await _createPeer(withMic: withMic, withCam: withCam);
-    _logLine('Answerer ready. Paste remote OFFER, then press Set REMOTE.');
-  }
+  // ---------- Answerer: join room ----------
+  Future<void> _joinRoomByInput({bool withMic = true, bool withCam = false}) async {
+    final raw = _roomCtrl.text.trim();
+    if (raw.isEmpty) return;
 
-  Future<void> _setRemote() async {
-    final txt = _remoteSdpCtrl.text.trim();
-    if (txt.isEmpty || _pc == null) return;
-    final map = jsonDecode(txt) as Map<String, dynamic>;
-    final desc = RTCSessionDescription(
-      map['sdp'] as String,
-      map['type'] as String,
-    );
-
-    await _pc!.setRemoteDescription(desc);
-    _logLine('Remote SDP set: ${desc.type}');
-
-    if (desc.type == 'offer') {
-      final answer = await _pc!.createAnswer({
-        'offerToReceiveAudio': true,
-        'offerToReceiveVideo': true,
-      });
-      await _pc!.setLocalDescription(answer);
-      await Future.delayed(const Duration(seconds: 1));
-      final local = await _pc!.getLocalDescription();
-      _localSdpCtrl.text = jsonEncode({'type': local!.type, 'sdp': local.sdp});
-      _logLine('Answer created. Send back to offerer.');
+    // поддержим как "id", так и ссылку вида "webrtc://208.123.185.205/<id>"
+    final id = _extractRoomId(raw);
+    if (id == null) {
+      _logLine('Invalid room code/link');
+      return;
     }
+
+    await _connectWS();
+    _sendWS({'type': 'join', 'roomId': id});
+
+    await _createPeer(withMic: withMic, withCam: withCam);
+    _logLine('Joining room $id …');
   }
 
-  // ---- Data channel ----
+  String? _extractRoomId(String raw) {
+    final r = raw.trim();
+    if (r.startsWith('webrtc://')) {
+      // ожидаем "webrtc://host/<id>"
+      final parts = r.split('/');
+      return parts.isNotEmpty ? parts.last : null;
+    }
+    if (r.contains('/')) {
+      // если прислали "http(s)://.../<id>"
+      final parts = r.split('/');
+      return parts.isNotEmpty ? parts.last : null;
+    }
+    return r; // просто id
+  }
+
+  // --------------------- Data channel ---------------------
 
   void _wireDataChannel() {
     _dc?.onMessage = (RTCDataChannelMessage msg) {
@@ -206,7 +305,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     _chatCtrl.clear();
   }
 
-  // ---- Media controls ----
+  // --------------------- Media controls ---------------------
 
   void _toggleMute() {
     final tracks = _localStream?.getAudioTracks();
@@ -221,10 +320,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   Future<void> _startMic() async {
     if (_pc == null) return;
-    final s = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
-      'video': false,
-    });
+    final s = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
     final track = s.getAudioTracks().first;
     await _pc!.addTrack(track, s);
     if (_localStream == null) {
@@ -254,10 +350,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   Future<void> _startCam() async {
     if (_pc == null) return;
-    final s = await navigator.mediaDevices.getUserMedia({
-      'audio': false,
-      'video': true,
-    });
+    final s = await navigator.mediaDevices.getUserMedia({'audio': false, 'video': true});
     final track = s.getVideoTracks().first;
     await _pc!.addTrack(track, s);
     if (_localStream == null) {
@@ -291,10 +384,13 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     _logLine('Camera switched');
   }
 
-  // ---- UI ----
+  // --------------------- UI ---------------------
 
   @override
   Widget build(BuildContext context) {
+    final shareLink =
+        _roomId == null ? '' : 'webrtc://208.123.185.205/$_roomId';
+
     return Scaffold(
       appBar: AppBar(title: const Text('flutter_webrtc P2P demo')),
       body: Padding(
@@ -306,27 +402,39 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
               runSpacing: 8,
               children: [
                 ElevatedButton(
-                  onPressed: () => _makeOffer(withMic: true, withCam: false),
-                  child: const Text('Create OFFER (audio)'),
+                  onPressed: () => _createRoomAndOffer(withMic: true, withCam: false),
+                  child: const Text('Create room (audio)'),
                 ),
                 ElevatedButton(
-                  onPressed: () => _makeOffer(withMic: true, withCam: true),
-                  child: const Text('Create OFFER (audio+video)'),
+                  onPressed: () => _createRoomAndOffer(withMic: true, withCam: true),
+                  child: const Text('Create room (audio+video)'),
+                ),
+                SizedBox(
+                  width: 320,
+                  child: TextField(
+                    controller: _roomCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Room ID or link',
+                      hintText: 'вставь id или ссылку',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
                 ),
                 ElevatedButton(
-                  onPressed: () => _beAnswerer(withMic: true, withCam: false),
-                  child: const Text('Become ANSWERER (audio)'),
+                  onPressed: () => _joinRoomByInput(withMic: true, withCam: false),
+                  child: const Text('Join (audio)'),
                 ),
                 ElevatedButton(
-                  onPressed: () => _beAnswerer(withMic: true, withCam: true),
-                  child: const Text('Become ANSWERER (audio+video)'),
-                ),
-                ElevatedButton(
-                  onPressed: _setRemote,
-                  child: const Text('Set REMOTE (paste below)'),
+                  onPressed: () => _joinRoomByInput(withMic: true, withCam: true),
+                  child: const Text('Join (audio+video)'),
                 ),
               ],
             ),
+            if (_roomId != null) ...[
+              const SizedBox(height: 8),
+              SelectableText('Room ID: $_roomId'),
+              SelectableText('Share link: $shareLink'),
+            ],
             const SizedBox(height: 12),
 
             // Media controls
@@ -386,22 +494,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
             const SizedBox(height: 12),
 
-            const Text('Local SDP (share this with peer):'),
-            TextField(
-              controller: _localSdpCtrl,
-              maxLines: 8,
-              decoration: const InputDecoration(border: OutlineInputBorder()),
-            ),
-            const SizedBox(height: 8),
-            const Text('Remote SDP (paste what you got from peer):'),
-            TextField(
-              controller: _remoteSdpCtrl,
-              maxLines: 8,
-              decoration: const InputDecoration(border: OutlineInputBorder()),
-            ),
-
-            const SizedBox(height: 12),
-
             Row(
               children: [
                 Expanded(
@@ -426,7 +518,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                 border: Border.all(),
                 borderRadius: BorderRadius.circular(6),
               ),
-              constraints: const BoxConstraints(minHeight: 120),
+              constraints: const BoxConstraints(minHeight: 160),
               child: Text(_log.join('\n')),
             ),
           ],
