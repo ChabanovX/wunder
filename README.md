@@ -1,3 +1,3 @@
 # wunder_calls
 
-A new Flutter project.
+Call your friends via this app!
