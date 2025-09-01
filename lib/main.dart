@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'dart:math';
 import 'dart:io' show Platform, WebSocket;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
@@ -33,12 +35,18 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   bool _muted = false;
 
   // UI
-  final _roomCtrl = TextEditingController(); // для join по roomId/ссылке
+  final _roomCtrl = TextEditingController();
   final _chatCtrl = TextEditingController();
 
   String? _roomId;
   final _log = <String>[];
   void _logLine(String s) => setState(() => _log.add(s));
+
+  // ICE: очередь до установки remote SDP
+  final _pendingIce = <RTCIceCandidate>[];
+  bool _remoteSet = false;
+
+  // --------------------------------------------------------------
 
   @override
   void initState() {
@@ -76,9 +84,12 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     _logLine('WS connected');
   }
 
+  // Автоматически проставляем roomId во все исходящие сообщения
   void _sendWS(Map<String, dynamic> m) {
-    final s = jsonEncode(m);
-    _ws?.add(s);
+    if (_roomId != null && !m.containsKey('roomId')) {
+      m['roomId'] = _roomId;
+    }
+    _ws?.add(jsonEncode(m));
   }
 
   Future<void> _onWSMessage(dynamic data) async {
@@ -86,14 +97,14 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     final type = msg['type'] as String?;
 
     switch (type) {
-      case 'created': // {type:'created', roomId:'...'}
-        _roomId = msg['roomId'] as String?;
-        _logLine('Room created: $_roomId');
-        _logLine('Share link: webrtc://208.123.185.205/$_roomId  (или просто id)');
+      case 'created': // сервер всё-таки прислал подтверждение
+      case 'room-created':
+        _roomId = (msg['roomId'] ?? msg['id']) as String?;
+        _logLine('Room confirmed by server: $_roomId');
         setState(() {});
         break;
 
-      case 'offer': // {type:'offer', sdp:'...'}
+      case 'offer':
         if (_pc == null) {
           await _createPeer(withMic: true, withCam: false);
         }
@@ -101,6 +112,12 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
           RTCSessionDescription(msg['sdp'] as String, 'offer'),
         );
         _logLine('Remote OFFER set');
+
+        _remoteSet = true;
+        for (final c in _pendingIce) {
+          await _pc!.addCandidate(c);
+        }
+        _pendingIce.clear();
 
         final answer = await _pc!.createAnswer({
           'offerToReceiveAudio': true,
@@ -112,27 +129,48 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
         _logLine('ANSWER sent');
         break;
 
-      case 'answer': // {type:'answer', sdp:'...'}
+      case 'answer':
         if (_pc == null) return;
         await _pc!.setRemoteDescription(
           RTCSessionDescription(msg['sdp'] as String, 'answer'),
         );
         _logLine('Remote ANSWER set');
+
+        _remoteSet = true;
+        for (final c in _pendingIce) {
+          await _pc!.addCandidate(c);
+        }
+        _pendingIce.clear();
         break;
 
-      case 'ice': // {type:'ice', candidate:{candidate, sdpMid, sdpMLineIndex}}
+      case 'ice':
         if (_pc == null) return;
-        final c = msg['candidate'] as Map<String, dynamic>;
-        await _pc!.addCandidate(
-          RTCIceCandidate(
+
+        // Поддерживаем оба формата: вложенный и плоский
+        RTCIceCandidate ice;
+        if (msg['candidate'] is Map) {
+          final c = msg['candidate'] as Map<String, dynamic>;
+          ice = RTCIceCandidate(
             c['candidate'] as String?,
             c['sdpMid'] as String?,
-            c['sdpMLineIndex'] as int?,
-          ),
-        );
+            (c['sdpMLineIndex'] as num?)?.toInt(),
+          );
+        } else {
+          ice = RTCIceCandidate(
+            msg['candidate'] as String?,
+            msg['sdpMid'] as String?,
+            (msg['sdpMLineIndex'] as num?)?.toInt(),
+          );
+        }
+
+        if (_remoteSet) {
+          await _pc!.addCandidate(ice);
+        } else {
+          _pendingIce.add(ice);
+        }
         break;
 
-      case 'joined': // опционально, если сервер шлёт подтверждение join
+      case 'joined':
         _logLine('Joined room ${msg['roomId']}');
         break;
 
@@ -144,10 +182,12 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   // --------------------- Peer & media ---------------------
 
   Future<void> _createPeer({bool withMic = true, bool withCam = false}) async {
+    _pendingIce.clear();
+    _remoteSet = false;
+
     final config = {
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
-        // Если добавишь TURN — допиши сюда
       ],
       'sdpSemantics': 'unified-plan',
       'iceTransportPolicy': 'all',
@@ -186,16 +226,17 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
           'candidate': {
             'candidate': cand.candidate,
             'sdpMid': cand.sdpMid,
-            'sdpMLineIndex': cand.sdpMLineIndex,
-
+            'sdpMLineIndex': cand.sdpMLineIndex, // <- правильное имя
           }
         });
+        final preview = cand.candidate!;
+        _logLine('ICE >> ${preview.length > 40 ? preview.substring(0, 40) : preview}…');
       }
     };
 
-    pc.onConnectionState = (state) {
-      _logLine('PC state: $state');
-    };
+    pc.onSignalingState = (s) => _logLine('Signaling: $s');
+    pc.onIceConnectionState = (s) => _logLine('ICE state: $s');
+    pc.onConnectionState = (s) => _logLine('PC state: $s');
 
     if (withMic || withCam) {
       final media = await navigator.mediaDevices.getUserMedia({
@@ -217,8 +258,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
       for (final t in media.getTracks()) {
         await pc.addTrack(t, media);
       }
-      _logLine('Local tracks added: '
-          '${withMic ? 'audio ' : ''}${withCam ? 'video' : ''}');
+      _logLine('Local tracks added: ${withMic ? 'audio ' : ''}${withCam ? 'video' : ''}');
 
       if (Platform.isAndroid || Platform.isIOS) {
         await Helper.setSpeakerphoneOn(true);
@@ -227,28 +267,35 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     }
   }
 
+  String _genRoomId() {
+    final rnd = Random();
+    // 8-символьный hex
+    return rnd.nextInt(0x7FFFFFFF).toRadixString(16).padLeft(8, '0');
+  }
+
   // ---------- Offerer: create room + send offer via WS ----------
   Future<void> _createRoomAndOffer({bool withMic = true, bool withCam = false}) async {
     await _connectWS();
 
-    // запрос на создание комнаты
-    _sendWS({'type': 'create'});
+    // генерим локально, чтобы сразу показать ссылку
+    _roomId = _genRoomId();
+    _logLine('Room created locally: $_roomId');
+    setState(() {}); // чтобы показалась ссылка
+
+    // сообщим серверу
+    _sendWS({'type': 'create', 'roomId': _roomId});
 
     await _createPeer(withMic: withMic, withCam: withCam);
 
-    // создаём DC сами (offerer)
+    // создаём data-channel (offerer)
     _dc = await _pc!.createDataChannel('chat', RTCDataChannelInit()..ordered = true);
     _wireDataChannel();
 
-    final offer = await _pc!.createOffer({
-      'offerToReceiveAudio': true,
-      'offerToReceiveVideo': true,
-    });
+    final offer = await _pc!.createOffer({'offerToReceiveAudio': true, 'offerToReceiveVideo': true});
     await _pc!.setLocalDescription(offer);
     final local = await _pc!.getLocalDescription();
 
-    // Отправляем оффер
-    _sendWS({'type': 'offer', 'sdp': local!.sdp});
+    _sendWS({'type': 'offer', 'sdp': local!.sdp}); // roomId подставится автоматически
     _logLine('OFFER sent via WS');
   }
 
@@ -257,7 +304,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     final raw = _roomCtrl.text.trim();
     if (raw.isEmpty) return;
 
-    // поддержим как "id", так и ссылку вида "webrtc://208.123.185.205/<id>"
     final id = _extractRoomId(raw);
     if (id == null) {
       _logLine('Invalid room code/link');
@@ -265,6 +311,10 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     }
 
     await _connectWS();
+
+    _roomId = id;              // фиксируем у себя
+    setState(() {});
+
     _sendWS({'type': 'join', 'roomId': id});
 
     await _createPeer(withMic: withMic, withCam: withCam);
@@ -274,12 +324,10 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   String? _extractRoomId(String raw) {
     final r = raw.trim();
     if (r.startsWith('webrtc://')) {
-      // ожидаем "webrtc://host/<id>"
       final parts = r.split('/');
       return parts.isNotEmpty ? parts.last : null;
     }
     if (r.contains('/')) {
-      // если прислали "http(s)://.../<id>"
       final parts = r.split('/');
       return parts.isNotEmpty ? parts.last : null;
     }
@@ -323,6 +371,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     final s = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
     final track = s.getAudioTracks().first;
     await _pc!.addTrack(track, s);
+
     if (_localStream == null) {
       _localStream = s;
       _localRenderer.srcObject = _localStream;
@@ -336,14 +385,15 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   }
 
   Future<void> _stopMic() async {
-    final a = _localStream?.getAudioTracks();
+    final a = _localStream?.getAudioTracks().toList(); // копия, чтобы не модифицировать во время итерации
     if (a != null) {
       for (final t in a) {
         await t.stop();
-        _localStream!.removeTrack(t);
+        _localStream?.removeTrack(t);
       }
     }
     _micOn = false;
+    _maybeCleanupLocalStream();
     setState(() {});
     _logLine('Mic stopped');
   }
@@ -365,16 +415,31 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   }
 
   Future<void> _stopCam() async {
-    final v = _localStream?.getVideoTracks();
+    final v = _localStream?.getVideoTracks().toList(); // <-- ВАЖНО: берём копию списка
     if (v != null) {
       for (final t in v) {
         await t.stop();
-        _localStream!.removeTrack(t);
+        _localStream?.removeTrack(t);
       }
     }
     _camOn = false;
+    _maybeCleanupLocalStream();
     setState(() {});
     _logLine('Camera stopped');
+  }
+
+  void _maybeCleanupLocalStream() {
+    // Если в стриме не осталось ни одного трека — чистим полностью
+    if (_localStream == null) return;
+    final hasAny = _localStream!.getTracks().isNotEmpty;
+    if (!hasAny) {
+      _localRenderer.srcObject = null;
+      _localStream!.dispose();
+      _localStream = null;
+    } else {
+      // есть ещё треки (например, звук) — убедимся, что renderer на стрим указывает
+      _localRenderer.srcObject = _localStream;
+    }
   }
 
   Future<void> _switchCamera() async {
@@ -388,8 +453,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   @override
   Widget build(BuildContext context) {
-    final shareLink =
-        _roomId == null ? '' : 'webrtc://208.123.185.205/$_roomId';
+    final shareLink = _roomId == null ? '' : 'webrtc://208.123.185.205/$_roomId';
 
     return Scaffold(
       appBar: AppBar(title: const Text('flutter_webrtc P2P demo')),
@@ -400,6 +464,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
             Wrap(
               spacing: 8,
               runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
               children: [
                 ElevatedButton(
                   onPressed: () => _createRoomAndOffer(withMic: true, withCam: false),
@@ -430,11 +495,13 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                 ),
               ],
             ),
+
             if (_roomId != null) ...[
               const SizedBox(height: 8),
               SelectableText('Room ID: $_roomId'),
               SelectableText('Share link: $shareLink'),
             ],
+
             const SizedBox(height: 12),
 
             // Media controls
@@ -467,7 +534,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
             const SizedBox(height: 12),
 
-            // Video views
+            // Видео окна
             Row(
               children: [
                 Expanded(
@@ -499,9 +566,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                 Expanded(
                   child: TextField(
                     controller: _chatCtrl,
-                    decoration: const InputDecoration(
-                      hintText: 'Type message…',
-                    ),
+                    decoration: const InputDecoration(hintText: 'Type message…'),
                   ),
                 ),
                 const SizedBox(width: 8),
