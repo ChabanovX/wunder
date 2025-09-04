@@ -10,6 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_webrtc: ^1.1.0
+  http: ^1.2.0   
 
 dev_dependencies:
   flutter_lints: ^5.0.0

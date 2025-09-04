@@ -5,6 +5,7 @@ import 'dart:io' show Platform, WebSocket;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,6 +21,8 @@ class WebRTCDemo extends StatefulWidget {
 class _WebRTCDemoState extends State<WebRTCDemo> {
   // ---------- configurable ----------
   static const String _serverUrl = 'ws://208.123.185.205:8080';
+  static const String _apiBase   = 'http://208.123.185.205:8000';
+  static const String _userId    = 'demo-device'; // можешь подставлять реальный user/device id
   // ----------------------------------
 
   RTCPeerConnection? _pc;
@@ -35,15 +38,12 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   bool _camOn = false;
   bool _muted = false;
 
-  // Что хотим слать в 1-м SDP-раунде
   bool _intendMic = false;
   bool _intendCam = false;
 
-  // UI
   final _roomCtrl = TextEditingController();
   final _chatCtrl = TextEditingController();
 
-  // Логи (скролл/копирование/очистка)
   final _log = <String>[];
   final _logScrollCtrl = ScrollController();
   bool _autoScrollLog = true;
@@ -58,11 +58,9 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   String? _roomId;
 
-  // ICE
   final _pendingIce = <RTCIceCandidate>[];
   bool _remoteSet = false;
 
-  // Транссиверы
   RTCRtpTransceiver? _audioTx;
   RTCRtpTransceiver? _videoTx;
 
@@ -84,6 +82,24 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     _chatCtrl.dispose();
     _ws?.close();
     super.dispose();
+  }
+
+  // --------------------- helpers ---------------------
+
+  Future<List<Map<String, dynamic>>> _fetchIceServers(String uid) async {
+    final uri = Uri.parse('$_apiBase/turn/credentials?user_id=$uid');
+    final resp = await http.get(uri).timeout(const Duration(seconds: 7));
+    if (resp.statusCode != 200) {
+      _logLine('TURN creds error: ${resp.statusCode} ${resp.body}');
+      throw Exception('TURN creds error');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final list = (body['iceServers'] as List).cast<Map<String, dynamic>>();
+    // логи для дебага
+    for (final s in list) {
+      _logLine('ICE from API: ${s['urls']} user=${s['username'] ?? '-'}');
+    }
+    return list;
   }
 
   // --------------------- WebSocket signaling ---------------------
@@ -123,7 +139,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
         if (_pc == null) {
           await _createPeer(withMic: _intendMic, withCam: _intendCam);
         }
-        // Локальные треки должны быть готовы ДО Answer
         await _ensureLocalSendReady();
 
         await _pc!.setRemoteDescription(
@@ -206,18 +221,14 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     _intendMic = withMic;
     _intendCam = withCam;
 
+    // 1) тянем ICE с сервера (эпхемерные TURN-креды)
+    final apiIce = await _fetchIceServers(_userId);
+
+    // 2) собираем конфиг
     final config = {
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
-        {
-          'urls': [
-            'turn:208.123.185.205:3478?transport=udp',
-            'turn:208.123.185.205:3478?transport=tcp',
-            'turn:208.123.185.205:443?transport=tcp',
-          ],
-          'username': 'webrtc',
-          'credential': 'webrtc-pass',
-        },
+        ...apiIce, // тут уже есть username/credential для turn:208.123.185.205:3478
       ],
       'sdpSemantics': 'unified-plan',
       'iceTransportPolicy': 'all',
@@ -285,7 +296,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   }
 
   Future<void> _ensureLocalSendReady() async {
-    // Если уже есть локальный стрим — просто синхронизируем состояния
     if (_localStream != null) {
       await _promoteDirections(
         sendAudio: _intendMic && _localStream!.getAudioTracks().isNotEmpty,
@@ -300,7 +310,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
       return;
     }
 
-    // Создаём РОВНО ОДИН локальный стрим
     final s = await navigator.mediaDevices.getUserMedia({
       'audio': _intendMic
           ? {
@@ -374,19 +383,16 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
       RTCRtpSender? videoSender;
 
-      // 1) уже существующий видео-sender
       for (final s in senders) {
         if (s.track?.kind == 'video') {
           videoSender = s;
           break;
         }
       }
-      // 2) пустой sender
       if (videoSender == null) {
         final empty = senders.where((s) => s.track == null);
         if (empty.isNotEmpty) videoSender = empty.first;
       }
-      // 3) хоть какой-нибудь
       videoSender ??= senders.isNotEmpty ? senders.first : null;
 
       if (videoSender != null) {
@@ -420,7 +426,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
     await _createPeer(withMic: withMic, withCam: withCam);
 
-    // DataChannel создаём у офферера
     _dc = await _pc!.createDataChannel('chat', RTCDataChannelInit()..ordered = true);
     _wireDataChannel();
 
@@ -505,7 +510,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   Future<void> _startMic() async {
     if (_pc == null) return;
 
-    // Уже есть — просто включим
     final existing = _localStream?.getAudioTracks() ?? const <MediaStreamTrack>[];
     if (existing.isNotEmpty) {
       for (final t in existing) t.enabled = true;
@@ -551,7 +555,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   Future<void> _startCam() async {
     if (_pc == null) return;
 
-    // Уже есть видео — включим
     final existing = _localStream?.getVideoTracks() ?? const <MediaStreamTrack>[];
     if (existing.isNotEmpty) {
       for (final t in existing) t.enabled = true;
@@ -563,7 +566,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
       return;
     }
 
-    // Тянем новый временный стрим, берём из него трек
     final tmp = await navigator.mediaDevices.getUserMedia({
       'audio': false,
       'video': {
@@ -575,7 +577,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     });
     final track = tmp.getVideoTracks().first;
 
-    // подчистим прежние видео-треки
     final old = _localStream?.getVideoTracks().toList() ?? [];
     for (final t in old) {
       await t.stop();
@@ -742,7 +743,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
             const SizedBox(height: 12),
 
-            // Видео окна
             Row(
               children: [
                 Expanded(
@@ -788,7 +788,6 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
             const SizedBox(height: 12),
 
-            // Логи + действия
             Row(
               children: [
                 const Text('Log:', style: TextStyle(fontWeight: FontWeight.bold)),
