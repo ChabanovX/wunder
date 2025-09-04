@@ -1,0 +1,37 @@
+version: "3.9"
+services:
+  signaling:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile.signaling
+    env_file: [ ../server/.env ]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile.api
+    env_file: [ ../server/.env ]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports: ["80:80","443:443"]
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [signaling, api]
+
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: "host"   # просто для удобства; на проде лучше явно мапить порты
+    volumes:
+      - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    command: ["-c", "/etc/turnserver.conf"]
+    restart: unless-stopped
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}

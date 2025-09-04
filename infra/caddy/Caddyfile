@@ -1,0 +1,10 @@
+api.yourdomain.com {
+    encode gzip
+    reverse_proxy /ws* signaling:8080    # проксируем WS -> твой signaling
+    reverse_proxy /    api:8000          # все остальное -> FastAPI API
+}
+
+turn.yourdomain.com {
+    # Если завернёшь TLS тут же, можно прокидывать на coturn:443 (или host network)
+    reverse_proxy 127.0.0.1:53443
+}

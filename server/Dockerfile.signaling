@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY server/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY server/signaling_ws.py .
+ENV SIGNALING_HOST=0.0.0.0 SIGNALING_PORT=8080
+CMD ["python", "signaling_ws.py"]
