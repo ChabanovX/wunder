@@ -1,17 +1,20 @@
 version: "3.9"
+
 services:
   signaling:
     build:
-      context: ..
+      context: ..                         # <— корень репо
       dockerfile: server/Dockerfile.signaling
-    env_file: [ ../server/.env ]
+    env_file:
+      - ../server/.env
     restart: unless-stopped
 
   api:
     build:
       context: ..
       dockerfile: server/Dockerfile.api
-    env_file: [ ../server/.env ]
+    env_file:
+      - ../server/.env
     restart: unless-stopped
 
   caddy:
@@ -22,10 +25,11 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on: [signaling, api]
+    restart: unless-stopped
 
   coturn:
     image: coturn/coturn:latest
-    network_mode: "host"   # просто для удобства; на проде лучше явно мапить порты
+    network_mode: "host"
     volumes:
       - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
