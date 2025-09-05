@@ -15,32 +15,17 @@ services:
       dockerfile: server/Dockerfile.api
     env_file:
       - ../server/.env
+    ports:
+      - "8000:8000"         # <— проброс API на хост
     restart: unless-stopped
-
-  # !!! ВРЕМЕННО отключаем Caddy, чтобы освободить 443
-  # caddy:
-  #   image: caddy:2
-  #   ports: ["80:80","443:443"]
-  #   volumes:
-  #     - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-  #     - caddy_data:/data
-  #     - caddy_config:/config
-  #   depends_on: [signaling, api]
-  #   restart: unless-stopped
 
   coturn:
     image: coturn/coturn:latest
-    # ВАЖНО: обычный режим сети (НЕ host)
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"
-      - "443:3478/tcp"   # <-- хост:443 → контейнер:3478 (tcp)
+      - "8443:8443/tcp"
     volumes:
       - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
-      # /etc/letsencrypt не нужен, т.к. мы без TLS
     command: ["-c", "/etc/turnserver.conf"]
     restart: unless-stopped
-
-volumes:
-  caddy_data: {}
-  caddy_config: {}

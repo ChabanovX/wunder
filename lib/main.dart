@@ -20,9 +20,9 @@ class WebRTCDemo extends StatefulWidget {
 
 class _WebRTCDemoState extends State<WebRTCDemo> {
   // ---------- configurable ----------
-  static const String _serverUrl = 'ws://208.123.185.205:8080';
-  static const String _apiBase   = 'http://208.123.185.205:8000';
-  static const String _userId    = 'demo-device'; // можешь подставлять реальный user/device id
+  static const String _wsUrl   = 'ws://208.123.185.205:8080';
+  static const String _apiBase = 'http://208.123.185.205:8000';
+  static const String _userId  = 'demo-device';
   // ----------------------------------
 
   RTCPeerConnection? _pc;
@@ -31,13 +31,14 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   MediaStream? _localStream;
 
-  final _localRenderer = RTCVideoRenderer();
+  final _localRenderer  = RTCVideoRenderer();
   final _remoteRenderer = RTCVideoRenderer();
 
   bool _micOn = false;
   bool _camOn = false;
   bool _muted = false;
 
+  // Что хотим слать в первом SDP-раунде
   bool _intendMic = false;
   bool _intendCam = false;
 
@@ -47,6 +48,7 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   final _log = <String>[];
   final _logScrollCtrl = ScrollController();
   bool _autoScrollLog = true;
+
   void _logLine(String s) {
     setState(() => _log.add(s));
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -57,12 +59,18 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
   }
 
   String? _roomId;
+  bool _iAmOfferer = false;
 
-  final _pendingIce = <RTCIceCandidate>[];
+  // ICE
+  final _pendingIce = <RTCIceCandidate>[]; // пока REMOTE не применён
   bool _remoteSet = false;
 
-  RTCRtpTransceiver? _audioTx;
-  RTCRtpTransceiver? _videoTx;
+  // Запоминаем senders, чтобы не плодить дубликаты
+  RTCRtpSender? _audioSender;
+  RTCRtpSender? _videoSender;
+
+  // TURN с API (+ гарантированный :443/tcp)
+  List<Map<String, dynamic>> _apiIce = [];
 
   @override
   void initState() {
@@ -95,19 +103,59 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     }
     final body = jsonDecode(resp.body) as Map<String, dynamic>;
     final list = (body['iceServers'] as List).cast<Map<String, dynamic>>();
-    // логи для дебага
+
+    // добавим turn:443/tcp теми же кредами (если нет)
+    String? uName;
+    String? uCred;
     for (final s in list) {
+      if (s.containsKey('username') && s.containsKey('credential')) {
+        uName ??= s['username'] as String?;
+        uCred ??= s['credential'] as String?;
+      }
       _logLine('ICE from API: ${s['urls']} user=${s['username'] ?? '-'}');
     }
+    if (uName != null && uCred != null) {
+      final has443 = list.any((s) {
+        final urls = s['urls'];
+        if (urls is String) {
+          return urls.startsWith('turn:') && urls.contains(':443?transport=tcp');
+        }
+        if (urls is List) {
+          return urls.any((e) =>
+              (e as String).startsWith('turn:') && e.contains(':443?transport=tcp'));
+        }
+        return false;
+      });
+      if (!has443) {
+        list.add({
+          'urls': ['turn:208.123.185.205:443?transport=tcp'],
+          'username': uName,
+          'credential': uCred,
+        });
+        _logLine('ICE added: turn:208.123.185.205:443?transport=tcp (same creds)');
+      }
+    }
     return list;
+  }
+
+  Map<String, dynamic> _buildRtcConfig() {
+    return {
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+        ..._apiIce,
+      ],
+      'sdpSemantics': 'unified-plan',
+      'iceTransportPolicy': 'all', // direct-first
+      'bundlePolicy': 'max-bundle',
+    };
   }
 
   // --------------------- WebSocket signaling ---------------------
 
   Future<void> _connectWS() async {
     if (_ws != null) return;
-    _logLine('Connecting WS to $_serverUrl …');
-    _ws = await WebSocket.connect(_serverUrl);
+    _logLine('Connecting WS to $_wsUrl …');
+    _ws = await WebSocket.connect(_wsUrl);
     _ws!.listen(_onWSMessage, onDone: () {
       _logLine('WS closed');
       _ws = null;
@@ -137,16 +185,18 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
       case 'offer':
         if (_pc == null) {
-          await _createPeer(withMic: _intendMic, withCam: _intendCam);
+          await _createPeer();
         }
-        await _ensureLocalSendReady();
-
         await _pc!.setRemoteDescription(
           RTCSessionDescription(msg['sdp'] as String, 'offer'),
         );
         _logLine('Remote OFFER set');
-
         _remoteSet = true;
+
+        // поднимем локальные треки ДО answer
+        await _ensureLocalSendReady();
+
+        // применим отложенные ICE
         for (final c in _pendingIce) {
           await _pc!.addCandidate(c);
         }
@@ -167,8 +217,8 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
           RTCSessionDescription(msg['sdp'] as String, 'answer'),
         );
         _logLine('Remote ANSWER set');
-
         _remoteSet = true;
+
         for (final c in _pendingIce) {
           await _pc!.addCandidate(c);
         }
@@ -179,14 +229,13 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
       case 'ice':
         if (_pc == null) return;
-
+        final obj = msg['candidate'];
         RTCIceCandidate ice;
-        if (msg['candidate'] is Map) {
-          final c = msg['candidate'] as Map<String, dynamic>;
+        if (obj is Map) {
           ice = RTCIceCandidate(
-            c['candidate'] as String?,
-            c['sdpMid'] as String?,
-            (c['sdpMLineIndex'] as num?)?.toInt(),
+            obj['candidate'] as String?,
+            obj['sdpMid'] as String?,
+            (obj['sdpMLineIndex'] as num?)?.toInt(),
           );
         } else {
           ice = RTCIceCandidate(
@@ -195,12 +244,15 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
             (msg['sdpMLineIndex'] as num?)?.toInt(),
           );
         }
-
         if (_remoteSet) {
           await _pc!.addCandidate(ice);
         } else {
           _pendingIce.add(ice);
         }
+        break;
+
+      case 'peer-joined':
+        _logLine('Peer joined: ${msg['peerId']}');
         break;
 
       case 'joined':
@@ -214,35 +266,18 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   // --------------------- Peer & media ---------------------
 
-  Future<void> _createPeer({bool withMic = true, bool withCam = false}) async {
+  Future<void> _createPeer() async {
     _pendingIce.clear();
     _remoteSet = false;
 
-    _intendMic = withMic;
-    _intendCam = withCam;
+    _apiIce = await _fetchIceServers(_userId);
 
-    // 1) тянем ICE с сервера (эпхемерные TURN-креды)
-    final apiIce = await _fetchIceServers(_userId);
-
-    // 2) собираем конфиг
-    final config = {
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'},
-        ...apiIce, // тут уже есть username/credential для turn:208.123.185.205:3478
-      ],
-      'sdpSemantics': 'unified-plan',
-      'iceTransportPolicy': 'all',
-      'bundlePolicy': 'max-bundle',
-    };
-
-    final constraints = {
+    final pc = await createPeerConnection(_buildRtcConfig(), {
       'mandatory': {},
       'optional': [
         {'DtlsSrtpKeyAgreement': true},
       ],
-    };
-
-    final pc = await createPeerConnection(config, constraints);
+    });
     _pc = pc;
 
     pc.onTrack = (RTCTrackEvent e) async {
@@ -280,74 +315,62 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     pc.onSignalingState = (s) => _logLine('Signaling: $s');
     pc.onIceConnectionState = (s) => _logLine('ICE state: $s');
     pc.onConnectionState = (s) => _logLine('PC state: $s');
-
-    // Объявляем оба m=audio/video заранее
-    _audioTx = await _pc!.addTransceiver(
-      kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
-      init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
-    );
-    _videoTx = await _pc!.addTransceiver(
-      kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
-      init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
-    );
-
-    // Готовим локальные треки до первого SDP
-    await _ensureLocalSendReady();
   }
 
   Future<void> _ensureLocalSendReady() async {
+    // создаём единый локальный стрим при необходимости
+    if (_localStream == null && (_intendMic || _intendCam)) {
+      _localStream = await createLocalMediaStream('local');
+    }
+
+    // микрофон
+    if (_intendMic) {
+      if ((_localStream?.getAudioTracks().isEmpty ?? true)) {
+        final s = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+        final track = s.getAudioTracks().first;
+        _localStream!.addTrack(track);
+        _audioSender = await _pc!.addTrack(track, _localStream!);
+      } else {
+        for (final t in _localStream!.getAudioTracks()) {
+          t.enabled = true;
+        }
+      }
+      _micOn = true;
+      _muted = false;
+    }
+
+    // камера
+    if (_intendCam) {
+      if ((_localStream?.getVideoTracks().isEmpty ?? true)) {
+        final tmp = await navigator.mediaDevices.getUserMedia({
+          'audio': false,
+          'video': {
+            'facingMode': 'user',
+            'width': {'ideal': 1280},
+            'height': {'ideal': 720},
+            'frameRate': {'ideal': 30},
+          },
+        });
+        final vTrack = tmp.getVideoTracks().first;
+        _localStream!.addTrack(vTrack);
+        _videoSender = await _pc!.addTrack(vTrack, _localStream!);
+      } else {
+        for (final t in _localStream!.getVideoTracks()) {
+          t.enabled = true;
+        }
+      }
+      _camOn = true;
+    }
+
+    // превью
     if (_localStream != null) {
-      await _promoteDirections(
-        sendAudio: _intendMic && _localStream!.getAudioTracks().isNotEmpty,
-        sendVideo: _intendCam && _localStream!.getVideoTracks().isNotEmpty,
-      );
-      await _ensureLocalPreview();
-      return;
+      _localRenderer.srcObject = _localStream;
     }
 
-    if (!_intendMic && !_intendCam) {
-      await _promoteDirections(sendAudio: false, sendVideo: false);
-      return;
-    }
-
-    final s = await navigator.mediaDevices.getUserMedia({
-      'audio': _intendMic
-          ? {
-              'echoCancellation': true,
-              'noiseSuppression': true,
-              'autoGainControl': true,
-            }
-          : false,
-      'video': _intendCam
-          ? {
-              'facingMode': 'user',
-              'width': {'ideal': 1280},
-              'height': {'ideal': 720},
-              'frameRate': {'ideal': 30},
-            }
-          : false,
-    });
-
-    _localStream = s;
-    _localRenderer.srcObject = _localStream;
-
-    for (final t in s.getTracks()) {
-      await _pc!.addTrack(t, s);
-    }
-
-    final v = s.getVideoTracks();
-    if (v.isNotEmpty) {
-      await _bindVideoToSender(v.first);
-    }
-
-    _micOn = _intendMic;
-    _camOn = _intendCam;
-    _muted = false;
-
-    await _promoteDirections(sendAudio: _micOn, sendVideo: _camOn);
-    await _ensureLocalPreview();
-
-    _logLine('Local tracks ready for first SDP: ${_micOn ? 'audio ' : ''}${_camOn ? 'video' : ''}');
+    _logLine(
+      'Local tracks now => audio:${_localStream?.getAudioTracks().length ?? 0} '
+      'video:${_localStream?.getVideoTracks().length ?? 0}',
+    );
 
     if (Platform.isAndroid || Platform.isIOS) {
       await Helper.setSpeakerphoneOn(true);
@@ -355,64 +378,24 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
     if (mounted) setState(() {});
   }
 
-  Future<void> _promoteDirections({required bool sendAudio, required bool sendVideo}) async {
-    if (_audioTx != null) {
-      await _audioTx!.setDirection(
-        sendAudio ? TransceiverDirection.SendRecv : TransceiverDirection.RecvOnly,
-      );
-    }
-    if (_videoTx != null) {
-      await _videoTx!.setDirection(
-        sendVideo ? TransceiverDirection.SendRecv : TransceiverDirection.RecvOnly,
-      );
-    }
+  // ---------- Offer helpers ----------
+
+  Future<void> _makeOffer() async {
+    if (_pc == null) return;
+    // просим обе m-lines даже если локального видео пока нет
+    final offer = await _pc!.createOffer({
+      'offerToReceiveAudio': 1,
+      'offerToReceiveVideo': 1,
+    });
+    await _pc!.setLocalDescription(offer);
+    final local = await _pc!.getLocalDescription();
+    _sendWS({'type': 'offer', 'sdp': local!.sdp});
+    _logLine('OFFER sent via WS');
   }
 
-  Future<void> _ensureLocalPreview() async {
-    if (_localStream != null) {
-      _localRenderer.srcObject = _localStream;
-    }
-    final a = _localStream?.getAudioTracks().length ?? 0;
-    final v = _localStream?.getVideoTracks().length ?? 0;
-    _logLine('Local tracks now => audio:$a video:$v');
-  }
-
-  Future<void> _bindVideoToSender(MediaStreamTrack track) async {
-    try {
-      final senders = await _pc!.getSenders();
-
-      RTCRtpSender? videoSender;
-
-      for (final s in senders) {
-        if (s.track?.kind == 'video') {
-          videoSender = s;
-          break;
-        }
-      }
-      if (videoSender == null) {
-        final empty = senders.where((s) => s.track == null);
-        if (empty.isNotEmpty) videoSender = empty.first;
-      }
-      videoSender ??= senders.isNotEmpty ? senders.first : null;
-
-      if (videoSender != null) {
-        await videoSender.replaceTrack(track);
-        _logLine('Video track bound via replaceTrack()');
-      } else {
-        _logLine('No RTCRtpSender available to bind video');
-      }
-    } catch (e) {
-      _logLine('bindVideoToSender error: $e');
-    }
-  }
-
-  String _genRoomId() {
-    final rnd = Random();
-    return rnd.nextInt(0x7FFFFFFF).toRadixString(16).padLeft(8, '0');
-  }
-
-  // ---------- Offerer ----------
+  // ---------- Offerer flow ----------
   Future<void> _createRoomAndOffer({bool withMic = true, bool withCam = false}) async {
+    _iAmOfferer = true;
     _intendMic = withMic;
     _intendCam = withCam;
 
@@ -424,21 +407,22 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
     _sendWS({'type': 'create', 'roomId': _roomId});
 
-    await _createPeer(withMic: withMic, withCam: withCam);
+    await _createPeer();
 
+    // готовим локальные треки ДО offer
+    await _ensureLocalSendReady();
+
+    // DataChannel у офферера
     _dc = await _pc!.createDataChannel('chat', RTCDataChannelInit()..ordered = true);
     _wireDataChannel();
 
-    final offer = await _pc!.createOffer({});
-    await _pc!.setLocalDescription(offer);
-    final local = await _pc!.getLocalDescription();
-
-    _sendWS({'type': 'offer', 'sdp': local!.sdp});
-    _logLine('OFFER sent via WS');
+    await _makeOffer();
+    Future.delayed(const Duration(seconds: 7), _dumpSelectedIce);
   }
 
-  // ---------- Answerer ----------
+  // ---------- Answerer flow ----------
   Future<void> _joinRoomByInput({bool withMic = true, bool withCam = false}) async {
+    _iAmOfferer = false;
     _intendMic = withMic;
     _intendCam = withCam;
 
@@ -458,8 +442,13 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
     _sendWS({'type': 'join', 'roomId': id});
 
-    await _createPeer(withMic: withMic, withCam: withCam);
+    await _createPeer();
     _logLine('Joining room $id …');
+  }
+
+  String _genRoomId() {
+    final rnd = Random();
+    return rnd.nextInt(0x7FFFFFFF).toRadixString(16).padLeft(8, '0');
   }
 
   String? _extractRoomId(String raw) {
@@ -509,118 +498,39 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
 
   Future<void> _startMic() async {
     if (_pc == null) return;
-
-    final existing = _localStream?.getAudioTracks() ?? const <MediaStreamTrack>[];
-    if (existing.isNotEmpty) {
-      for (final t in existing) t.enabled = true;
-      _micOn = true;
-      _muted = false;
-      await _promoteDirections(sendAudio: true, sendVideo: _camOn);
-      await _ensureLocalPreview();
-      setState(() {});
-      _logLine('Mic resumed');
-      return;
-    }
-
-    final s = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
-    final track = s.getAudioTracks().first;
-
-    _localStream ??= await createLocalMediaStream('local');
-    _localStream!.addTrack(track);
-    _localRenderer.srcObject = _localStream;
-
-    await _pc!.addTrack(track, _localStream!);
-
-    _micOn = true; _muted = false;
-    await _promoteDirections(sendAudio: true, sendVideo: _camOn);
-    await _ensureLocalPreview();
-    setState(() {});
-    _logLine('Mic started');
+    _intendMic = true;
+    await _ensureLocalSendReady();
+    _logLine('Mic started/resumed');
   }
 
   Future<void> _stopMic() async {
     final a = _localStream?.getAudioTracks().toList() ?? [];
     for (final t in a) {
-      await t.stop();
-      _localStream?.removeTrack(t);
+      t.enabled = false;
     }
+    _intendMic = false;
     _micOn = false;
-    await _promoteDirections(sendAudio: false, sendVideo: _camOn);
-    _maybeCleanupLocalStream();
-    await _ensureLocalPreview();
+    _muted = true;
     setState(() {});
     _logLine('Mic stopped');
   }
 
   Future<void> _startCam() async {
     if (_pc == null) return;
-
-    final existing = _localStream?.getVideoTracks() ?? const <MediaStreamTrack>[];
-    if (existing.isNotEmpty) {
-      for (final t in existing) t.enabled = true;
-      _camOn = true;
-      await _promoteDirections(sendAudio: _micOn, sendVideo: true);
-      await _ensureLocalPreview();
-      setState(() {});
-      _logLine('Camera resumed');
-      return;
-    }
-
-    final tmp = await navigator.mediaDevices.getUserMedia({
-      'audio': false,
-      'video': {
-        'facingMode': 'user',
-        'width': {'ideal': 1280},
-        'height': {'ideal': 720},
-        'frameRate': {'ideal': 30},
-      },
-    });
-    final track = tmp.getVideoTracks().first;
-
-    final old = _localStream?.getVideoTracks().toList() ?? [];
-    for (final t in old) {
-      await t.stop();
-      _localStream?.removeTrack(t);
-    }
-
-    _localStream ??= await createLocalMediaStream('local');
-    _localStream!.addTrack(track);
-
-    await _bindVideoToSender(track);
-    _localRenderer.srcObject = _localStream;
-
-    await _pc!.addTrack(track, _localStream!);
-
-    _camOn = true;
-    await _promoteDirections(sendAudio: _micOn, sendVideo: true);
-    await _ensureLocalPreview();
-    setState(() {});
-    _logLine('Camera started');
+    _intendCam = true;
+    await _ensureLocalSendReady();
+    _logLine('Camera started/resumed');
   }
 
   Future<void> _stopCam() async {
     final v = _localStream?.getVideoTracks().toList() ?? [];
     for (final t in v) {
-      await t.stop();
-      _localStream?.removeTrack(t);
+      t.enabled = false;
     }
+    _intendCam = false;
     _camOn = false;
-    await _promoteDirections(sendAudio: _micOn, sendVideo: false);
-    _maybeCleanupLocalStream();
-    await _ensureLocalPreview();
     setState(() {});
     _logLine('Camera stopped');
-  }
-
-  void _maybeCleanupLocalStream() {
-    if (_localStream == null) return;
-    if (_localStream!.getTracks().isEmpty) {
-      _localRenderer.srcObject = null;
-      _localStream!.dispose();
-      _localStream = null;
-    } else {
-      _localRenderer.srcObject = _localStream;
-    }
   }
 
   Future<void> _switchCamera() async {
@@ -650,7 +560,8 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
           final rp = remote?.values['protocol'];
 
           _logLine('ICE PAIR => local:$lt/$lp  remote:$rt/$rp');
-          _logLine('ICE BYTES => sent:${r.values['bytesSent']} recv:${r.values['bytesReceived']}');
+          _logLine(
+              'ICE BYTES => sent:${r.values['bytesSent']} recv:${r.values['bytesReceived']}');
         }
       }
     } catch (e) {
@@ -676,11 +587,13 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
               crossAxisAlignment: WrapCrossAlignment.center,
               children: [
                 ElevatedButton(
-                  onPressed: () => _createRoomAndOffer(withMic: true, withCam: false),
+                  onPressed: () =>
+                      _createRoomAndOffer(withMic: true, withCam: false),
                   child: const Text('Create room (audio)'),
                 ),
                 ElevatedButton(
-                  onPressed: () => _createRoomAndOffer(withMic: true, withCam: true),
+                  onPressed: () =>
+                      _createRoomAndOffer(withMic: true, withCam: true),
                   child: const Text('Create room (audio+video)'),
                 ),
                 SizedBox(
@@ -695,11 +608,13 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                   ),
                 ),
                 ElevatedButton(
-                  onPressed: () => _joinRoomByInput(withMic: true, withCam: false),
+                  onPressed: () =>
+                      _joinRoomByInput(withMic: true, withCam: false),
                   child: const Text('Join (audio)'),
                 ),
                 ElevatedButton(
-                  onPressed: () => _joinRoomByInput(withMic: true, withCam: true),
+                  onPressed: () =>
+                      _joinRoomByInput(withMic: true, withCam: true),
                   child: const Text('Join (audio+video)'),
                 ),
               ],
@@ -753,7 +668,8 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                       child: RTCVideoView(
                         _localRenderer,
                         mirror: true,
-                        objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                        objectFit:
+                            RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
                       ),
                     ),
                   ),
@@ -778,11 +694,15 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                 Expanded(
                   child: TextField(
                     controller: _chatCtrl,
-                    decoration: const InputDecoration(hintText: 'Type message…'),
+                    decoration:
+                        const InputDecoration(hintText: 'Type message…'),
                   ),
                 ),
                 const SizedBox(width: 8),
-                ElevatedButton(onPressed: _sendChat, child: const Text('Send')),
+                ElevatedButton(
+                  onPressed: _sendChat,
+                  child: const Text('Send'),
+                ),
               ],
             ),
 
@@ -794,7 +714,9 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                 const SizedBox(width: 8),
                 TextButton(
                   onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: _log.join('\n')));
+                    await Clipboard.setData(
+                      ClipboardData(text: _log.join('\n')),
+                    );
                     if (mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(content: Text('Logs copied to clipboard')),
@@ -812,7 +734,11 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                   child: const Text('Dump ICE now'),
                 ),
                 TextButton(
-                  onPressed: _ensureLocalPreview,
+                  onPressed: () {
+                    if (_localStream != null) {
+                      _localRenderer.srcObject = _localStream;
+                    }
+                  },
                   child: const Text('Fix Preview'),
                 ),
                 const Spacer(),
@@ -822,12 +748,14 @@ class _WebRTCDemoState extends State<WebRTCDemo> {
                     const Text('Auto-scroll'),
                     Switch(
                       value: _autoScrollLog,
-                      onChanged: (v) => setState(() => _autoScrollLog = v),
+                      onChanged: (v) =>
+                          setState(() => _autoScrollLog = v),
                     ),
                   ],
                 ),
               ],
             ),
+
             Container(
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(
