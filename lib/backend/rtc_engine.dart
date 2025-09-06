@@ -376,9 +376,8 @@ class WebRTCEngine {
         remoteRenderer.srcObject ??= await createLocalMediaStream('remote');
         remoteRenderer.srcObject!.addTrack(e.track);
       }
+      forceRebindRemote();                 // ← ДОБАВИТЬ ЭТО
       _log('Remote track: ${e.track.kind}');
-      // сразу после прихода трека освежим биндинг
-      forceRebindRemote();
     };
 
 
@@ -583,10 +582,8 @@ class WebRTCEngine {
   }
 
   void forceRebindRemote() {
-    final s = remoteRenderer.srcObject;
-    if (s != null) {
-      // достаточно присвоить ещё раз (без null-флипа) — обновляет texture
-      remoteRenderer.srcObject = s;
+    if (remoteRenderer.srcObject != null) {
+      remoteRenderer.srcObject = remoteRenderer.srcObject; // пинок рендереру
     }
   }
 
