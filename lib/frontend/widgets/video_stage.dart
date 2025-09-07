@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../backend/rtc_engine.dart';
 
-class VideoStage extends StatelessWidget {
+class VideoStage extends StatefulWidget {
   const VideoStage({
     super.key,
     required this.engine,
@@ -15,76 +15,122 @@ class VideoStage extends StatelessWidget {
   final String roomId;
 
   @override
-  Widget build(BuildContext context) {
-    final e = engine;
-    final shareLink = 'webrtc://208.123.185.205/$roomId';
+  State<VideoStage> createState() => _VideoStageState();
+}
 
-    return Stack(
-      children: [
-        // REMOTE – во весь экран. Оборачиваем в ValueListenableBuilder,
-        // чтобы форсить перестройку, когда появляется/пересоздаётся remote track.
-        Positioned.fill(
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              const ColoredBox(color: Colors.black),
-              ValueListenableBuilder<bool>(
-                valueListenable: e.connected,
-                builder: (_, __, ___) {
-                  return RTCVideoView(
-                    e.remoteRenderer,
-                    key: ValueKey(e.remoteRenderer.hashCode),
-                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-                    placeholderBuilder: (_) => const Center(
-                      child: CircularProgressIndicator(strokeWidth: 2),
+class _VideoStageState extends State<VideoStage> {
+  // Позиция мини-окна (левый-верхний угол) в координатах Stack
+  Offset? _selfPos;
+
+  // Габариты мини-окна (портрет 9:16)
+  static const double _selfH = 180.0;
+  static const double _selfW = _selfH * (9 / 16);
+
+  // Отступы и примерные высоты верхней/нижней панелей для расчёта границ
+  static const double _pad = 12.0;
+  static const double _topBarHeight = 44.0;     // высота строки Room/Copy/Status
+  static const double _bottomBarHeight = 70.0;  // высота панели кнопок
+
+  @override
+  Widget build(BuildContext context) {
+    final e = widget.engine;
+    final shareLink = 'webrtc://208.123.185.205/${widget.roomId}';
+
+    final safe = MediaQuery.of(context).padding;
+
+    return LayoutBuilder(
+      builder: (context, box) {
+        // Рассчитываем границы перемещения превью
+        final minX = _pad;
+        final maxX = (box.maxWidth - _selfW - _pad).clamp(_pad, box.maxWidth);
+        final minY = safe.top + _pad + _topBarHeight; // под верхней строкой
+        final maxY = (box.maxHeight - _selfH - (safe.bottom + _pad + _bottomBarHeight))
+            .clamp(0.0, box.maxHeight);
+
+        // Стартовая позиция — справа снизу (как просили)
+        _selfPos ??= Offset(maxX, maxY);
+
+        // Клэмпим, если размеры экрана поменялись (поворот и т.п.)
+        _selfPos = Offset(
+          _selfPos!.dx.clamp(minX, maxX),
+          _selfPos!.dy.clamp(minY, maxY),
+        );
+
+        return Stack(
+          children: [
+            // REMOTE — на весь экран
+            Positioned.fill(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  const ColoredBox(color: Colors.black),
+                  ValueListenableBuilder<bool>(
+                    valueListenable: e.connected,
+                    builder: (_, __, ___) => RTCVideoView(
+                      e.remoteRenderer,
+                      key: ValueKey(e.remoteRenderer.hashCode),
+                      objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                      placeholderBuilder: (_) =>
+                          const Center(child: CircularProgressIndicator(strokeWidth: 2)),
                     ),
-                  );
+                  ),
+                ],
+              ),
+            ),
+
+            // Верх: Room + Copy / Chat / статус
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: Row(
+                  children: [
+                    _RoomInfo(roomId: widget.roomId, shareLink: shareLink),
+                    const Spacer(),
+                    _RoundIconButton(
+                      icon: Icons.chat_bubble_outline_rounded,
+                      onTap: () => _openLogsSheet(context, e),
+                    ),
+                    const SizedBox(width: 10),
+                    ValueListenableBuilder<bool>(
+                      valueListenable: e.connected,
+                      builder: (_, ok, __) => Chip(
+                        avatar: Icon(ok ? Icons.check_circle : Icons.sync, size: 18),
+                        label: Text(ok ? 'Connected' : 'Connecting…'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // Перетаскиваемое self-view
+            Positioned(
+              left: _selfPos!.dx,
+              top: _selfPos!.dy,
+              child: _DraggableSelfView(
+                engine: e,
+                width: _selfW,
+                height: _selfH,
+                onDragUpdate: (delta) {
+                  setState(() {
+                    final nx = (_selfPos!.dx + delta.dx).clamp(minX, maxX);
+                    final ny = (_selfPos!.dy + delta.dy).clamp(minY, maxY);
+                    _selfPos = Offset(nx, ny);
+                  });
                 },
               ),
-            ],
-          ),
-        ),
-
-        // Верх: Room + Copy / Chat / Статус
-        SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Row(
-              children: [
-                _RoomInfo(roomId: roomId, shareLink: shareLink),
-                const Spacer(),
-                _RoundIconButton(
-                  icon: Icons.chat_bubble_outline_rounded,
-                  onTap: () => _openLogsSheet(context, e),
-                ),
-                const SizedBox(width: 10),
-                ValueListenableBuilder<bool>(
-                  valueListenable: e.connected,
-                  builder: (_, ok, __) => Chip(
-                    avatar: Icon(ok ? Icons.check_circle : Icons.sync, size: 18),
-                    label: Text(ok ? 'Connected' : 'Connecting…'),
-                  ),
-                ),
-              ],
             ),
-          ),
-        ),
 
-        // Self-view (поднят выше панели, скругления + кнопка switch)
-        Positioned(
-          right: 12,
-          bottom: 168, // подняли выше, чтобы не перекрывалось панелью
-          child: _SelfViewMini(engine: e),
-        ),
-
-        // Низ: панель управления (тёмная прозрачная, adaptive Wrap)
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: 0,
-          child: SafeArea(top: false, child: _ControlsBar(engine: e)),
-        ),
-      ],
+            // Низ: панель управления
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: SafeArea(top: false, child: _ControlsBar(engine: e)),
+            ),
+          ],
+        );
+      },
     );
   }
 
@@ -139,10 +185,8 @@ class VideoStage extends StatelessWidget {
                     builder: (_, list, __) => ListView.builder(
                       controller: controller,
                       itemCount: list.length,
-                      itemBuilder: (_, i) => Text(
-                        list[i],
-                        style: const TextStyle(color: Colors.white70),
-                      ),
+                      itemBuilder: (_, i) =>
+                          Text(list[i], style: const TextStyle(color: Colors.white70)),
                     ),
                   ),
                 ),
@@ -179,6 +223,7 @@ class _RoomInfo extends StatelessWidget {
             InkWell(
               onTap: () async {
                 await Clipboard.setData(ClipboardData(text: shareLink));
+                // лаконичный фидбек
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(content: Text('Copied')),
                 );
@@ -196,69 +241,79 @@ class _RoomInfo extends StatelessWidget {
   }
 }
 
-class _SelfViewMini extends StatelessWidget {
-  const _SelfViewMini({required this.engine});
+class _DraggableSelfView extends StatelessWidget {
+  const _DraggableSelfView({
+    required this.engine,
+    required this.width,
+    required this.height,
+    required this.onDragUpdate,
+  });
+
   final WebRTCEngine engine;
+  final double width;
+  final double height;
+  final ValueChanged<Offset> onDragUpdate;
 
   @override
   Widget build(BuildContext context) {
-    const double h = 180.0;
-
-    // «Пнуть» привязку после первого layout — лечит чёрный экран на части устройств.
+    // подстраховка от «чёрного экрана» на части девайсов
     WidgetsBinding.instance.addPostFrameCallback((_) => engine.forceRebindLocal());
 
-    final borderRadius = BorderRadius.circular(16);
+    final r = BorderRadius.circular(16);
 
-    return SizedBox(
-      height: h,
-      width: h * (9 / 16),
-      child: Stack(
-        children: [
-          ClipRRect(
-            borderRadius: borderRadius,
-            child: Container(
-              color: Colors.black,
-              child: ValueListenableBuilder<bool>(
-                valueListenable: engine.camOn,
-                builder: (_, __, ___) => RTCVideoView(
-                  engine.localRenderer,
-                  key: ValueKey(engine.camOn.value), // пересоздание при on/off
-                  mirror: true,
-                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-                  placeholderBuilder: (_) => const ColoredBox(color: Colors.black54),
-                ),
-              ),
-            ),
-          ),
-          // тонкая рамка поверх
-          Positioned.fill(
-            child: IgnorePointer(
+    return GestureDetector(
+      onPanUpdate: (d) => onDragUpdate(d.delta),
+      child: SizedBox(
+        width: width,
+        height: height,
+        child: Stack(
+          children: [
+            ClipRRect(
+              borderRadius: r,
               child: Container(
-                decoration: BoxDecoration(
-                  borderRadius: borderRadius,
-                  border: Border.all(color: Colors.white24, width: 1),
+                color: Colors.black,
+                child: ValueListenableBuilder<bool>(
+                  valueListenable: engine.camOn,
+                  builder: (_, __, ___) => RTCVideoView(
+                    engine.localRenderer,
+                    key: ValueKey(engine.camOn.value),
+                    mirror: true,
+                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                    placeholderBuilder: (_) => const ColoredBox(color: Colors.black54),
+                  ),
                 ),
               ),
             ),
-          ),
-          // кнопка смены камеры
-          Positioned(
-            right: 6,
-            top: 6,
-            child: Material(
-              color: Colors.black.withOpacity(.45),
-              shape: const CircleBorder(),
-              child: InkWell(
-                customBorder: const CircleBorder(),
-                onTap: engine.switchCamera,
-                child: const Padding(
-                  padding: EdgeInsets.all(8),
-                  child: Icon(Icons.cameraswitch, size: 20, color: Colors.white),
+            // рамка
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: r,
+                    border: Border.all(color: Colors.white24, width: 1),
+                  ),
                 ),
               ),
             ),
-          ),
-        ],
+            // кнопка смены камеры
+            Positioned(
+              right: 6,
+              top: 6,
+              child: Material(
+                color: Colors.black.withOpacity(.45),
+                shape: const CircleBorder(),
+                child: InkWell(
+                  customBorder: const CircleBorder(),
+                  onTap: engine.switchCamera,
+                  child: const Padding(
+                    padding: EdgeInsets.all(8),
+                    child: Icon(Icons.cameraswitch, size: 20, color: Colors.white),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
