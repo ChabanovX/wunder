@@ -1,10 +1,11 @@
+// lib/main.dart
+import 'dart:math';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
-// относительные импорты из lib/
+import 'config/env.dart';
 import 'backend/rtc_engine.dart';
 import 'frontend/call_page.dart';
-
-
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,16 +17,31 @@ class WunderApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final engine = WebRTCEngine(
-      wsUrl: 'ws://208.123.185.205:8080',
-      apiBase: 'http://208.123.185.205:8000',
-      userId: 'demo-device',
-    );
-
     return MaterialApp(
       title: 'Wunder WebRTC',
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
-      home: CallPage(engine: engine),
+      onGenerateRoute: (settings) {
+        // deeplink: /r/<roomId> для веба
+        String? initialRoomId;
+        if (kIsWeb) {
+          final segs = Uri.base.pathSegments;
+          if (segs.isNotEmpty && segs.first == 'r' && segs.length >= 2) {
+            initialRoomId = segs[1];
+          }
+        }
+
+        final engine = WebRTCEngine(
+          wsUrl: Env.wsUrl,
+          apiBase: Env.apiBase,
+          userId: 'client-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(9999)}',
+          // если в WebRTCEngine есть поля для TURN — разблокируй:
+          // turnHost: Env.turnHost, turnUser: Env.turnUser, turnPass: Env.turnPass,
+        );
+
+        return MaterialPageRoute(
+          builder: (_) => CallPage(engine: engine, initialRoomId: initialRoomId),
+        );
+      },
     );
   }
 }

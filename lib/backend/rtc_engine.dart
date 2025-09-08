@@ -8,12 +8,14 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 
+import '../config/env.dart'; // <-- читаем WS_URL / API_BASE / TURN_* через --dart-define
+
 /// Единый движок: WebRTC + сигналинг WebSocket + TURN.
 class WebRTCEngine {
   // ---------- конфиг ----------
-  final String wsUrl;     // ws://host:8080
-  final String apiBase;   // http://host:8000
-  final String userId;    // demo-device
+  final String wsUrl;     // напр.: wss://signal.wundercalls.ru/ws
+  final String apiBase;   // напр.: https://api.wundercalls.ru
+  final String userId;    // любой стабильный ID
 
   WebRTCEngine({
     required this.wsUrl,
@@ -54,7 +56,7 @@ class WebRTCEngine {
   RTCRtpSender? _audioSender;
   RTCRtpSender? _videoSender;
 
-  // TURN (из API)
+  // ICE-сервера с API
   List<Map<String, dynamic>> _apiIce = [];
 
   // защита от гонок при answer
@@ -176,7 +178,6 @@ class WebRTCEngine {
     localRenderer.srcObject = _localStream; // ребинд
     _log('Camera switched');
   }
-
 
   Future<void> hangUp() async {
     _sendWS({'type': 'bye'});
@@ -359,7 +360,22 @@ class WebRTCEngine {
     _pendingIce.clear();
     _remoteSet = false;
 
+    // 1) подтянем ICE-сервера с твоего API (если настроено)
     _apiIce = await _fetchIceServers(userId);
+
+    // 2) добавим статический TURN из Env (если задан)
+    if (Env.turnHost.isNotEmpty) {
+      _apiIce.add({
+        'urls': 'turn:${Env.turnHost}:3478?transport=udp',
+        'username': Env.turnUser,
+        'credential': Env.turnPass,
+      });
+      _apiIce.add({
+        'urls': 'turns:${Env.turnHost}:5349?transport=tcp',
+        'username': Env.turnUser,
+        'credential': Env.turnPass,
+      });
+    }
 
     final pc = await createPeerConnection(_buildRtcConfig(), {
       'mandatory': {},
@@ -376,10 +392,9 @@ class WebRTCEngine {
         remoteRenderer.srcObject ??= await createLocalMediaStream('remote');
         remoteRenderer.srcObject!.addTrack(e.track);
       }
-      forceRebindRemote();                 // ← ДОБАВИТЬ ЭТО
+      forceRebindRemote();
       _log('Remote track: ${e.track.kind}');
     };
-
 
     pc.onDataChannel = (RTCDataChannel dc) {
       _dc = dc;
@@ -414,44 +429,22 @@ class WebRTCEngine {
 
   Future<List<Map<String, dynamic>>> _fetchIceServers(String uid) async {
     final uri = Uri.parse('$apiBase/turn/credentials?user_id=$uid');
-    final resp = await http.get(uri).timeout(const Duration(seconds: 7));
-    if (resp.statusCode != 200) {
-      _log('TURN creds error: ${resp.statusCode} ${resp.body}');
-      throw Exception('TURN creds error');
-    }
-    final body = jsonDecode(resp.body) as Map<String, dynamic>;
-    final list = (body['iceServers'] as List).cast<Map<String, dynamic>>();
-
-    String? uName;
-    String? uCred;
-    for (final s in list) {
-      if (s.containsKey('username') && s.containsKey('credential')) {
-        uName ??= s['username'] as String?;
-        uCred ??= s['credential'] as String?;
+    try {
+      final resp = await http.get(uri).timeout(const Duration(seconds: 7));
+      if (resp.statusCode != 200) {
+        _log('TURN creds error: ${resp.statusCode} ${resp.body}');
+        return [];
       }
-      _log('ICE from API: ${s['urls']} user=${s['username'] ?? '-'}');
-    }
-    if (uName != null && uCred != null) {
-      final has443 = list.any((s) {
-        final urls = s['urls'];
-        if (urls is String) {
-          return urls.startsWith('turn:') && urls.contains(':443?transport=tcp');
-        }
-        if (urls is List) {
-          return urls.any((e) => (e as String).startsWith('turn:') && e.contains(':443?transport=tcp'));
-        }
-        return false;
-      });
-      if (!has443) {
-        list.add({
-          'urls': ['turn:208.123.185.205:443?transport=tcp'],
-          'username': uName,
-          'credential': uCred,
-        });
-        _log('ICE added: turn:208.123.185.205:443?transport=tcp (same creds)');
+      final body = jsonDecode(resp.body) as Map<String, dynamic>;
+      final list = (body['iceServers'] as List).cast<Map<String, dynamic>>();
+      for (final s in list) {
+        _log('ICE from API: ${s['urls']} user=${s['username'] ?? '-'}');
       }
+      return list;
+    } catch (e) {
+      _log('TURN creds fetch failed: $e');
+      return [];
     }
-    return list;
   }
 
   Map<String, dynamic> _buildRtcConfig() {
