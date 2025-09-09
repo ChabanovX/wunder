@@ -1,14 +1,14 @@
 // lib/backend/rtc_engine.dart
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Platform, WebSocket;
 import 'dart:math';
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart'; // ✅ исправляет ValueNotifier
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
+import 'package:web_socket_channel/web_socket_channel.dart';
 
-import '../config/env.dart'; // <-- читаем WS_URL / API_BASE / TURN_* через --dart-define
+import '../config/env.dart';
 
 /// Единый движок: WebRTC + сигналинг WebSocket + TURN.
 class WebRTCEngine {
@@ -45,7 +45,7 @@ class WebRTCEngine {
   // внутреннее
   RTCPeerConnection? _pc;
   RTCDataChannel? _dc;
-  WebSocket? _ws;
+  WebSocketChannel? _wsChan;
   MediaStream? _localStream;
 
   // ICE
@@ -79,7 +79,8 @@ class WebRTCEngine {
     try { await _localStream?.dispose(); } catch (_) {}
     try { await localRenderer.dispose(); } catch (_) {}
     try { await remoteRenderer.dispose(); } catch (_) {}
-    try { await _ws?.close(); } catch (_) {}
+    try { await _wsChan?.sink.close(); } catch (_) {}
+    _wsChan = null;
     await _chatIn.close();
   }
 
@@ -216,15 +217,15 @@ class WebRTCEngine {
   // --------------------- internals ---------------------
 
   Future<void> _ensureWS() async {
-    if (_ws != null) return;
+    if (_wsChan != null) return;
     _log('Connecting WS to $wsUrl …');
-    _ws = await WebSocket.connect(wsUrl);
-    _ws!.listen(_onWSMessage, onDone: () {
+    _wsChan = WebSocketChannel.connect(Uri.parse(wsUrl));
+    _wsChan!.stream.listen(_onWSMessage, onDone: () {
       _log('WS closed');
-      _ws = null;
+      _wsChan = null;
     }, onError: (e) {
       _log('WS error: $e');
-      _ws = null;
+      _wsChan = null;
     });
     _log('WS connected');
   }
@@ -232,11 +233,12 @@ class WebRTCEngine {
   void _sendWS(Map<String, dynamic> m) {
     final id = roomId.value;
     if (id != null && !m.containsKey('roomId')) m['roomId'] = id;
-    _ws?.add(jsonEncode(m));
+    _wsChan?.sink.add(jsonEncode(m));
   }
 
   Future<void> _onWSMessage(dynamic data) async {
-    final msg = jsonDecode(data as String) as Map<String, dynamic>;
+    final text = data is String ? data : utf8.decode((data as List<int>));
+    final msg = jsonDecode(text) as Map<String, dynamic>;
     final type = msg['type'] as String?;
 
     switch (type) {
@@ -305,7 +307,7 @@ class WebRTCEngine {
         break;
 
       default:
-        _log('WS << ${data.toString()}');
+        _log('WS << ${text.toString()}');
     }
   }
 
@@ -506,7 +508,10 @@ class WebRTCEngine {
     _log('Local tracks now => audio:${_localStream?.getAudioTracks().length ?? 0} '
         'video:${_localStream?.getVideoTracks().length ?? 0}');
 
-    if (Platform.isAndroid || Platform.isIOS) {
+    final isMobile = !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.android ||
+            defaultTargetPlatform == TargetPlatform.iOS);
+    if (isMobile) {
       await Helper.setSpeakerphoneOn(true);
     }
   }

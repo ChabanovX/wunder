@@ -2,22 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-<key>com.apple.security.device.camera</key><true/>
-<key>com.apple.security.device.microphone</key><true/>
+  <!-- App Sandbox включен -->
+  <key>com.apple.security.app-sandbox</key><true/>
 
-<key>com.apple.security.network.client</key>
-<true/>
-<key>com.apple.security.network.server</key>
-<true/>
-<key>com.apple.security.cs.allow-jit</key>
-<true/>
-<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-<true/>
-	<key>com.apple.security.app-sandbox</key>
-	<true/>
-	<key>com.apple.security.cs.allow-jit</key>
-	<true/>
-	<key>com.apple.security.network.server</key>
-	<true/>
+  <!-- Сетевой клиент (WebSocket/HTTP/HTTPS/WSS) -->
+  <key>com.apple.security.network.client</key><true/>
+
+  <!-- Доступ к устройствам -->
+  <key>com.apple.security.device.camera</key><true/>
+  <key>com.apple.security.device.microphone</key><true/>
+
+  <!-- Нужно только для DEBUG: разрешить JIT и небезопасную память -->
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
 </dict>
 </plist>

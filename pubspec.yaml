@@ -9,6 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_web_plugins:
+    sdk: flutter
   flutter_webrtc: ^1.1.0
   http: ^1.2.0
   web_socket_channel: ^2.4.0
