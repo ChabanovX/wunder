@@ -1,9 +1,9 @@
-// lib/backend/rtc_engine.dart
+// ignore_for_file: avoid_print
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
-import 'package:flutter/foundation.dart'; // ✅ исправляет ValueNotifier
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -56,6 +56,10 @@ class WebRTCEngine {
   RTCRtpSender? _audioSender;
   RTCRtpSender? _videoSender;
 
+  // адресный сигналинг
+  String? _myPeerId;
+  String? _remotePeerId;
+
   // ICE-сервера с API
   List<Map<String, dynamic>> _apiIce = [];
 
@@ -82,6 +86,8 @@ class WebRTCEngine {
     try { await _wsChan?.sink.close(); } catch (_) {}
     _wsChan = null;
     await _chatIn.close();
+    _myPeerId = null;
+    _remotePeerId = null;
   }
 
   // --------------------- Public UI methods ---------------------
@@ -151,9 +157,7 @@ class WebRTCEngine {
     final tracks = _localStream?.getAudioTracks();
     if (tracks == null || tracks.isEmpty) return;
     final nextMuted = !muted.value;
-    for (final t in tracks) {
-      t.enabled = !nextMuted;
-    }
+    for (final t in tracks) t.enabled = !nextMuted;
     muted.value = nextMuted;
     _log(nextMuted ? 'Mic muted' : 'Mic unmuted');
   }
@@ -181,11 +185,12 @@ class WebRTCEngine {
   }
 
   Future<void> hangUp() async {
-    _sendWS({'type': 'bye'});
+    _sendWS({'type': 'bye', 'to': _remotePeerId});
     _log('Hangup requested');
     await _closePeer();
     roomId.value = null;
     connected.value = false;
+    _remotePeerId = null;
   }
 
   Future<void> dumpSelectedIce() async {
@@ -196,7 +201,8 @@ class WebRTCEngine {
 
       for (final r in stats) {
         if (r.type == 'candidate-pair' &&
-            ((r.values['selected'] == true) || (r.values['state'] == 'succeeded'))) {
+            ((r.values['selected'] == true) ||
+             (r.values['state'] == 'succeeded'))) {
           final local = byId[r.values['localCandidateId']];
           final remote = byId[r.values['remoteCandidateId']];
 
@@ -233,6 +239,7 @@ class WebRTCEngine {
   void _sendWS(Map<String, dynamic> m) {
     final id = roomId.value;
     if (id != null && !m.containsKey('roomId')) m['roomId'] = id;
+    if (_remotePeerId != null && !m.containsKey('to')) m['to'] = _remotePeerId;
     _wsChan?.sink.add(jsonEncode(m));
   }
 
@@ -243,21 +250,42 @@ class WebRTCEngine {
 
     switch (type) {
       case 'created':
-      case 'room-created':
-        roomId.value = (msg['roomId'] ?? msg['id']) as String?;
-        _log('Room confirmed by server: ${roomId.value}');
+        roomId.value = msg['roomId'] as String?;
+        _myPeerId = msg['peerId'] as String?;
+        _log('Room confirmed by server: ${roomId.value}, myPeerId=$_myPeerId');
+        break;
+
+      case 'joined':
+        roomId.value = msg['roomId'] as String?;
+        _myPeerId = msg['peerId'] as String?;
+        _log('Joined room ${roomId.value}, myPeerId=$_myPeerId');
+        break;
+
+      case 'peer-joined':
+        _remotePeerId = msg['peerId'] as String?;
+        _log('Peer joined: $_remotePeerId');
+
+        // если у нас уже есть локальный оффер — адресно переотправим его новому пиру
+        final desc = await _pc?.getLocalDescription();
+        if (desc != null && desc.type == 'offer' && desc.sdp != null) {
+          _sendWS({'type': 'offer', 'sdp': desc.sdp, 'to': _remotePeerId});
+          _log('Re-send local OFFER to $_remotePeerId');
+        }
         break;
 
       case 'offer':
+        // оффер всегда приходит с "from" — это и есть удалённый peerId
+        _remotePeerId = (msg['from'] ?? _remotePeerId) as String?;
         await _onRemoteOffer(msg['sdp'] as String);
         break;
 
       case 'answer':
+        _remotePeerId = (msg['from'] ?? _remotePeerId) as String?;
         if (_pc == null) return;
         await _pc!.setRemoteDescription(
           RTCSessionDescription(msg['sdp'] as String, 'answer'),
         );
-        _log('Remote ANSWER set');
+        _log('Remote ANSWER set (from: $_remotePeerId)');
         _remoteSet = true;
 
         for (final c in _pendingIce) {
@@ -269,41 +297,32 @@ class WebRTCEngine {
         break;
 
       case 'ice':
+        final from = msg['from'] as String?;
         if (_pc == null) return;
         final obj = msg['candidate'];
-        RTCIceCandidate ice;
-        if (obj is Map) {
-          ice = RTCIceCandidate(
-            obj['candidate'] as String?,
-            obj['sdpMid'] as String?,
-            (obj['sdpMLineIndex'] as num?)?.toInt(),
-          );
-        } else {
-          ice = RTCIceCandidate(
-            msg['candidate'] as String?,
-            msg['sdpMid'] as String?,
-            (msg['sdpMLineIndex'] as num?)?.toInt(),
-          );
-        }
+        final ice = (obj is Map)
+            ? RTCIceCandidate(obj['candidate'] as String?, obj['sdpMid'] as String?, (obj['sdpMLineIndex'] as num?)?.toInt())
+            : RTCIceCandidate(msg['candidate'] as String?, msg['sdpMid'] as String?, (msg['sdpMLineIndex'] as num?)?.toInt());
+
         if (_remoteSet) {
           await _pc!.addCandidate(ice);
         } else {
           _pendingIce.add(ice);
         }
+        _log('ICE << from:$from  cached=${!_remoteSet}');
         break;
 
-      case 'peer-joined':
-        _log('Peer joined: ${msg['peerId']}');
-        break;
-
-      case 'joined':
-        _log('Joined room ${msg['roomId']}');
+      case 'peer-left':
+        final pid = msg['peerId'];
+        _log('Peer left: $pid');
+        if (_remotePeerId == pid) _remotePeerId = null;
         break;
 
       case 'bye':
         _log('Peer hung up');
         await _closePeer();
         roomId.value = null;
+        _remotePeerId = null;
         break;
 
       default:
@@ -314,10 +333,8 @@ class WebRTCEngine {
   Future<void> _onRemoteOffer(String sdp) async {
     if (_pc == null) await _createPeer();
 
-    await _pc!.setRemoteDescription(
-      RTCSessionDescription(sdp, 'offer'),
-    );
-    _log('Remote OFFER set');
+    await _pc!.setRemoteDescription(RTCSessionDescription(sdp, 'offer'));
+    _log('Remote OFFER set (from: $_remotePeerId)');
     _remoteSet = true;
 
     // гарантируем наличие m-lines под ответ даже без локальных треков
@@ -341,16 +358,16 @@ class WebRTCEngine {
       final answer = await _pc!.createAnswer({});
       await _pc!.setLocalDescription(answer);
       final local = await _pc!.getLocalDescription();
-      _sendWS({'type': 'answer', 'sdp': local!.sdp});
-      _log('ANSWER sent');
+      _sendWS({'type': 'answer', 'sdp': local!.sdp, 'to': _remotePeerId});
+      _log('ANSWER sent to $_remotePeerId');
     } catch (e) {
       _log('createAnswer failed: $e; retry with forced recvonly…');
       await _ensureRecvTransceivers(force: true);
       final retry = await _pc!.createAnswer({});
       await _pc!.setLocalDescription(retry);
       final local = await _pc!.getLocalDescription();
-      _sendWS({'type': 'answer', 'sdp': local!.sdp});
-      _log('ANSWER sent (retry)');
+      _sendWS({'type': 'answer', 'sdp': local!.sdp, 'to': _remotePeerId});
+      _log('ANSWER sent (retry) to $_remotePeerId');
     } finally {
       _makingAnswer = false;
     }
@@ -412,10 +429,11 @@ class WebRTCEngine {
             'candidate': cand.candidate,
             'sdpMid': cand.sdpMid,
             'sdpMLineIndex': cand.sdpMLineIndex,
-          }
+          },
+          'to': _remotePeerId,
         });
         final preview = cand.candidate!;
-        _log('ICE >> ${preview.length > 40 ? preview.substring(0, 40) : preview}…');
+        _log('ICE >> ${preview.length > 40 ? preview.substring(0, 40) : preview}… to=$_remotePeerId');
       }
     };
 
@@ -450,14 +468,32 @@ class WebRTCEngine {
   }
 
   Map<String, dynamic> _buildRtcConfig() {
+    // Нормализуем: по одной url на запись
+    final norm = <Map<String, dynamic>>[];
+    for (final s in [
+      {'urls': 'stun:stun.l.google.com:19302'},
+      ..._apiIce,
+    ]) {
+      final u = s['urls'];
+      if (u is List) {
+        for (final one in u) {
+          norm.add({
+            'urls': one,
+            if (s['username'] != null) 'username': s['username'],
+            if (s['credential'] != null) 'credential': s['credential'],
+          });
+        }
+      } else {
+        norm.add(s);
+      }
+    }
+
     return {
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'},
-        ..._apiIce,
-      ],
+      'iceServers': norm,
       'sdpSemantics': 'unified-plan',
-      'iceTransportPolicy': 'all',
+      'iceTransportPolicy': Env.forceRelay ? 'relay' : 'all', // диагностика
       'bundlePolicy': 'max-bundle',
+      'rtcpMuxPolicy': 'require',
     };
   }
 
@@ -533,8 +569,8 @@ class WebRTCEngine {
     });
     await _pc!.setLocalDescription(offer);
     final local = await _pc!.getLocalDescription();
-    _sendWS({'type': 'offer', 'sdp': local!.sdp});
-    _log('OFFER sent via WS');
+    _sendWS({'type': 'offer', 'sdp': local!.sdp, 'to': _remotePeerId});
+    _log('OFFER sent via WS to=$_remotePeerId');
   }
 
   // Гарантировать наличие recvonly transceiver'ов под answer

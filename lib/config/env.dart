@@ -13,7 +13,23 @@ class Env {
   );
 
   // TURN (fallback для сложных NAT)
-  static const turnHost = String.fromEnvironment('TURN_HOST', defaultValue: '');
-  static const turnUser = String.fromEnvironment('TURN_USER', defaultValue: '');
-  static const turnPass = String.fromEnvironment('TURN_PASS', defaultValue: '');
+  static const turnHost = String.fromEnvironment(
+    'TURN_HOST',
+    defaultValue: '',
+  );
+  static const turnUser = String.fromEnvironment(
+    'TURN_USER',
+    defaultValue: '',
+  );
+  static const turnPass = String.fromEnvironment(
+    'TURN_PASS',
+    defaultValue: '',
+  );
+
+  // Флаг для диагностики: если true, то iceTransportPolicy = 'relay'
+  // и соединение будет строиться только через TURN
+  static const forceRelay = bool.fromEnvironment(
+    'FORCE_RELAY',
+    defaultValue: false,
+  );
 }
