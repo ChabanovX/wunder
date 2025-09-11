@@ -7,11 +7,13 @@ class CallPage extends StatefulWidget {
   const CallPage({
     super.key,
     required this.engine,
-    this.initialRoomId, // <- новый параметр
+    this.initialRoomId,
+    this.autoJoinOnStartup = true, // авто-join по диплинку
   });
 
   final WebRTCEngine engine;
   final String? initialRoomId;
+  final bool autoJoinOnStartup;
 
   @override
   State<CallPage> createState() => _CallPageState();
@@ -23,14 +25,20 @@ class _CallPageState extends State<CallPage> {
   @override
   void initState() {
     super.initState();
-    widget.engine.init();
+    _init(); // делаем корректную async-инициализацию
+  }
 
-    // если пришли по ссылке /r/<roomId> — сразу подключаемся
+  Future<void> _init() async {
+    // Важно: инициализируем рендереры ДО любых join/offer
+    await widget.engine.init();
+
+    // автоподключение только если явно разрешено и есть валидный roomId
     final rid = widget.initialRoomId;
-    if (rid != null && rid.isNotEmpty) {
+    if (widget.autoJoinOnStartup && rid != null && rid.isNotEmpty) {
       _roomCtrl.text = rid; // чтобы показывалось в Lobby при возврате
-      // по умолчанию подключаемся с микрофоном, без камеры (можешь поменять)
-      widget.engine.joinRoom(rid, withMic: true, withCam: false);
+      // По умолчанию: микрофон ON, камера OFF (пользователь включит из UI).
+      // При включении камеры у гостя пойдёт ренегоциация — у хоста появится видео.
+      await widget.engine.joinRoom(rid, withMic: true, withCam: false);
     }
   }
 

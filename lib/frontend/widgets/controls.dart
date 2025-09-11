@@ -23,20 +23,20 @@ class MediaControls extends StatelessWidget {
               alignment: WrapAlignment.center,
               children: [
                 FilledButton.tonalIcon(
-                  onPressed: mic ? e.stopMic : e.startMic,
+                  onPressed: () => mic ? e.stopMic() : e.startMic(),
                   icon: Icon(mic ? Icons.mic_off : Icons.mic),
                   label: Text(mic ? 'Stop Mic' : 'Start Mic'),
                 ),
                 ValueListenableBuilder<bool>(
                   valueListenable: e.muted,
                   builder: (_, m, __) => FilledButton.tonalIcon(
-                    onPressed: e.toggleMute,
+                    onPressed: () => e.toggleMute(),
                     icon: Icon(m ? Icons.volume_up : Icons.volume_off),
                     label: Text(m ? 'Unmute' : 'Mute'),
                   ),
                 ),
                 FilledButton.tonalIcon(
-                  onPressed: cam ? e.stopCam : e.startCam,
+                  onPressed: () => cam ? e.stopCam() : e.startCam(),
                   icon: Icon(cam ? Icons.videocam_off : Icons.videocam),
                   label: Text(cam ? 'Stop Cam' : 'Start Cam'),
                 ),

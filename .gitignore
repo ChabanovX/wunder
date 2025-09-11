@@ -57,3 +57,4 @@ DerivedData/
 
 # Local per-developer config (каждый делает свой, не в репо)
 ios/Config/Local.xcconfig
+.vercel

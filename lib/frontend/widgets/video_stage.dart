@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../backend/rtc_engine.dart';
+import '../utils/deeplink.dart';
 
 class VideoStage extends StatefulWidget {
   const VideoStage({
@@ -34,7 +35,7 @@ class _VideoStageState extends State<VideoStage> {
   @override
   Widget build(BuildContext context) {
     final e = widget.engine;
-    final shareLink = 'webrtc://208.123.185.205/${widget.roomId}';
+    final shareLink = buildJoinUrl(widget.roomId);
 
     final safe = MediaQuery.of(context).padding;
 
@@ -342,7 +343,7 @@ class _ControlsBar extends StatelessWidget {
             builder: (_, m, __) => _darkPill(
               icon: m ? Icons.volume_up : Icons.volume_off,
               label: m ? 'Unmute' : 'Mute',
-              onTap: e.toggleMute,
+              onTap: () => e.toggleMute(),
             ),
           ),
           ValueListenableBuilder<bool>(
@@ -350,7 +351,7 @@ class _ControlsBar extends StatelessWidget {
             builder: (_, mic, __) => _darkPill(
               icon: mic ? Icons.mic_off : Icons.mic,
               label: mic ? 'Stop Mic' : 'Start Mic',
-              onTap: mic ? e.stopMic : e.startMic,
+              onTap: () => mic ? e.stopMic() : e.startMic(),
             ),
           ),
           ValueListenableBuilder<bool>(
@@ -358,7 +359,7 @@ class _ControlsBar extends StatelessWidget {
             builder: (_, cam, __) => _darkPill(
               icon: cam ? Icons.videocam_off : Icons.videocam,
               label: cam ? 'Stop Cam' : 'Start Cam',
-              onTap: cam ? e.stopCam : e.startCam,
+              onTap: () => cam ? e.stopCam() : e.startCam(),
             ),
           ),
           _endButton(context, e),

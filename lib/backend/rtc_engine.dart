@@ -1,4 +1,6 @@
+// lib/backend/rtc_engine.dart
 // ignore_for_file: avoid_print
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
@@ -10,12 +12,12 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../config/env.dart';
 
-/// Единый движок: WebRTC + сигналинг WebSocket + TURN.
+/// WebRTC движок: PeerConnection + WebSocket-сигналинг + TURN.
 class WebRTCEngine {
   // ---------- конфиг ----------
-  final String wsUrl;     // напр.: wss://signal.wundercalls.ru/ws
-  final String apiBase;   // напр.: https://api.wundercalls.ru
-  final String userId;    // любой стабильный ID
+  final String wsUrl;   // напр.: wss://signal.wundercalls.ru/ws
+  final String apiBase; // напр.: https://api.wundercalls.ru
+  final String userId;
 
   WebRTCEngine({
     required this.wsUrl,
@@ -35,10 +37,10 @@ class WebRTCEngine {
   final ValueNotifier<List<String>> logs = ValueNotifier<List<String>>([]);
 
   // чат
-  final StreamController<String> _chatIn = StreamController.broadcast();
+  final _chatIn = StreamController<String>.broadcast();
   Stream<String> get chatStream => _chatIn.stream;
 
-  // желаемые состояния (что хотим слать в первом SDP)
+  // желаемые состояния (какие треки хотим слать)
   bool _intendMic = false;
   bool _intendCam = false;
 
@@ -60,17 +62,15 @@ class WebRTCEngine {
   String? _myPeerId;
   String? _remotePeerId;
 
-  // ICE-сервера с API
+  // ICE-серверы с API
   List<Map<String, dynamic>> _apiIce = [];
 
-  // защита от гонок при answer
+  // гонки
   bool _makingAnswer = false;
+  bool _negotiationInFlight = false;
 
-  // util
-  void _log(String s) {
-    final next = List<String>.from(logs.value)..add(s);
-    logs.value = next;
-  }
+  // утиль логов
+  void _log(String s) => logs.value = [...logs.value, s];
 
   Future<void> init() async {
     await localRenderer.initialize();
@@ -90,8 +90,9 @@ class WebRTCEngine {
     _remotePeerId = null;
   }
 
-  // --------------------- Public UI methods ---------------------
+  // --------------------- Public API ---------------------
 
+  /// Создать комнату (обычно хост). По умолчанию: mic=on, cam=off.
   Future<void> createRoom({bool withMic = true, bool withCam = false}) async {
     _intendMic = withMic;
     _intendCam = withCam;
@@ -113,7 +114,12 @@ class WebRTCEngine {
     Future.delayed(const Duration(seconds: 7), dumpSelectedIce);
   }
 
-  Future<void> joinRoom(String raw, {bool withMic = true, bool withCam = false}) async {
+  /// Присоединиться к комнате (обычно гость). Рекомендуется mic=on, cam=off.
+  Future<void> joinRoom(
+    String raw, {
+    bool withMic = true,
+    bool withCam = false,
+  }) async {
     final id = _extractRoomId(raw);
     if (id == null || id.isEmpty) {
       _log('Invalid room code/link');
@@ -127,8 +133,20 @@ class WebRTCEngine {
     roomId.value = id;
 
     _sendWS({'type': 'join', 'roomId': id});
-
     await _createPeer();
+
+    // Создаём локальные треки сразу (браузер спросит доступ при необходимости).
+    await _ensureLocalSendReady();
+
+    // Если камеру стартуем "выключенной" — трек есть, но disabled.
+    if (!_intendCam) {
+      for (final t in _localStream?.getVideoTracks() ?? const []) {
+        t.enabled = false;
+      }
+      camOn.value = false;
+      _log('Camera slot prepared but disabled (waiting for user action)');
+    }
+
     _log('Joining room $id …');
   }
 
@@ -141,39 +159,101 @@ class WebRTCEngine {
   Future<void> startMic() async {
     _intendMic = true;
     await _ensureLocalSendReady();
+
+    // найдём/включим аудио-транссивер
+    final txs = await _pc?.getTransceivers() ?? [];
+    RTCRtpTransceiver? atx;
+    for (final t in txs) {
+      final kind = t.receiver.track?.kind ?? t.sender.track?.kind;
+      if (kind == 'audio') { atx = t; break; }
+    }
+    atx ??= await _pc!.addTransceiver(
+      kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
+      init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv),
+    );
+    await atx.setDirection(TransceiverDirection.SendRecv);
+
+    final aTracks = _localStream?.getAudioTracks() ?? const [];
+    if (aTracks.isNotEmpty) {
+      await atx.sender.replaceTrack(aTracks.first);
+      _audioSender ??= atx.sender;
+    }
+
+    micOn.value = true;
+    muted.value = false;
     _log('Mic started/resumed');
+    await _renegotiate('startMic');
   }
 
   Future<void> stopMic() async {
-    final a = _localStream?.getAudioTracks().toList() ?? [];
-    for (final t in a) t.enabled = false;
+    for (final t in _localStream?.getAudioTracks().toList() ?? const []) {
+      t.enabled = false;
+    }
+
+    final txs = await _pc?.getTransceivers() ?? [];
+    for (final t in txs) {
+      final kind = t.receiver.track?.kind ?? t.sender.track?.kind;
+      if (kind == 'audio') {
+        await t.sender.replaceTrack(null);
+        await t.setDirection(TransceiverDirection.RecvOnly);
+        break;
+      }
+    }
+
     _intendMic = false;
     micOn.value = false;
     muted.value = true;
     _log('Mic stopped');
-  }
-
-  void toggleMute() {
-    final tracks = _localStream?.getAudioTracks();
-    if (tracks == null || tracks.isEmpty) return;
-    final nextMuted = !muted.value;
-    for (final t in tracks) t.enabled = !nextMuted;
-    muted.value = nextMuted;
-    _log(nextMuted ? 'Mic muted' : 'Mic unmuted');
+    await _renegotiate('stopMic');
   }
 
   Future<void> startCam() async {
     _intendCam = true;
     await _ensureLocalSendReady();
+
+    final txs = await _pc?.getTransceivers() ?? [];
+    RTCRtpTransceiver? vtx;
+    for (final t in txs) {
+      final kind = t.receiver.track?.kind ?? t.sender.track?.kind;
+      if (kind == 'video') { vtx = t; break; }
+    }
+    vtx ??= await _pc!.addTransceiver(
+      kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+      init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv),
+    );
+    await vtx.setDirection(TransceiverDirection.SendRecv);
+
+    final vTracks = _localStream?.getVideoTracks() ?? const [];
+    if (vTracks.isNotEmpty) {
+      vTracks.first.enabled = true;
+      await vtx.sender.replaceTrack(vTracks.first);
+      _videoSender ??= vtx.sender;
+    }
+
+    camOn.value = true;
     _log('Camera started/resumed');
+    await _renegotiate('startCam');
   }
 
   Future<void> stopCam() async {
-    final v = _localStream?.getVideoTracks().toList() ?? [];
-    for (final t in v) t.enabled = false;
+    for (final t in _localStream?.getVideoTracks().toList() ?? const []) {
+      t.enabled = false;
+    }
+
+    final txs = await _pc?.getTransceivers() ?? [];
+    for (final t in txs) {
+      final kind = t.receiver.track?.kind ?? t.sender.track?.kind;
+      if (kind == 'video') {
+        await t.sender.replaceTrack(null);
+        await t.setDirection(TransceiverDirection.RecvOnly);
+        break;
+      }
+    }
+
     _intendCam = false;
     camOn.value = false;
     _log('Camera stopped');
+    await _renegotiate('stopCam');
   }
 
   Future<void> switchCamera() async {
@@ -182,6 +262,18 @@ class WebRTCEngine {
     await Helper.switchCamera(v.first);
     localRenderer.srcObject = _localStream; // ребинд
     _log('Camera switched');
+    await _renegotiate('switchCamera');
+  }
+
+  void toggleMute() {
+    final tracks = _localStream?.getAudioTracks();
+    if (tracks == null || tracks.isEmpty) return;
+    final nextMuted = !muted.value;
+    for (final t in tracks) {
+      t.enabled = !nextMuted;
+    }
+    muted.value = nextMuted;
+    _log(nextMuted ? 'Mic muted' : 'Mic unmuted');
   }
 
   Future<void> hangUp() async {
@@ -220,7 +312,7 @@ class WebRTCEngine {
     }
   }
 
-  // --------------------- internals ---------------------
+  // --------------------- сигналинг / SDP ---------------------
 
   Future<void> _ensureWS() async {
     if (_wsChan != null) return;
@@ -265,7 +357,7 @@ class WebRTCEngine {
         _remotePeerId = msg['peerId'] as String?;
         _log('Peer joined: $_remotePeerId');
 
-        // если у нас уже есть локальный оффер — адресно переотправим его новому пиру
+        // если у нас есть локальный OFFER — переотправим адресно новому пиру
         final desc = await _pc?.getLocalDescription();
         if (desc != null && desc.type == 'offer' && desc.sdp != null) {
           _sendWS({'type': 'offer', 'sdp': desc.sdp, 'to': _remotePeerId});
@@ -274,7 +366,6 @@ class WebRTCEngine {
         break;
 
       case 'offer':
-        // оффер всегда приходит с "from" — это и есть удалённый peerId
         _remotePeerId = (msg['from'] ?? _remotePeerId) as String?;
         await _onRemoteOffer(msg['sdp'] as String);
         break;
@@ -297,19 +388,26 @@ class WebRTCEngine {
         break;
 
       case 'ice':
-        final from = msg['from'] as String?;
         if (_pc == null) return;
         final obj = msg['candidate'];
         final ice = (obj is Map)
-            ? RTCIceCandidate(obj['candidate'] as String?, obj['sdpMid'] as String?, (obj['sdpMLineIndex'] as num?)?.toInt())
-            : RTCIceCandidate(msg['candidate'] as String?, msg['sdpMid'] as String?, (msg['sdpMLineIndex'] as num?)?.toInt());
+            ? RTCIceCandidate(
+                obj['candidate'] as String?,
+                obj['sdpMid'] as String?,
+                (obj['sdpMLineIndex'] as num?)?.toInt(),
+              )
+            : RTCIceCandidate(
+                msg['candidate'] as String?,
+                msg['sdpMid'] as String?,
+                (msg['sdpMLineIndex'] as num?)?.toInt(),
+              );
 
         if (_remoteSet) {
           await _pc!.addCandidate(ice);
         } else {
           _pendingIce.add(ice);
         }
-        _log('ICE << from:$from  cached=${!_remoteSet}');
+        _log('ICE << from:${msg['from']}  cached=${!_remoteSet}');
         break;
 
       case 'peer-left':
@@ -326,7 +424,7 @@ class WebRTCEngine {
         break;
 
       default:
-        _log('WS << ${text.toString()}');
+        _log('WS << $text');
     }
   }
 
@@ -337,10 +435,10 @@ class WebRTCEngine {
     _log('Remote OFFER set (from: $_remotePeerId)');
     _remoteSet = true;
 
-    // гарантируем наличие m-lines под ответ даже без локальных треков
+    // гарантируем наличие m-lines даже без локальных треков
     await _ensureRecvTransceivers();
 
-    // если хотим говорить/показывать себя — подготовим локальные треки ДО answer
+    // подготовим локальные треки под ответ (если нужны)
     await _ensureLocalSendReady();
 
     for (final c in _pendingIce) {
@@ -379,10 +477,10 @@ class WebRTCEngine {
     _pendingIce.clear();
     _remoteSet = false;
 
-    // 1) подтянем ICE-сервера с твоего API (если настроено)
+    // 1) ICE с твоего API
     _apiIce = await _fetchIceServers(userId);
 
-    // 2) добавим статический TURN из Env (если задан)
+    // 2) статический TURN из Env, если задан
     if (Env.turnHost.isNotEmpty) {
       _apiIce.add({
         'urls': 'turn:${Env.turnHost}:3478?transport=udp',
@@ -404,6 +502,16 @@ class WebRTCEngine {
     });
     _pc = pc;
 
+    // заранее создаём по одному транссиверу под A/V (Unified Plan)
+    await pc.addTransceiver(
+      kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
+      init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv),
+    );
+    await pc.addTransceiver(
+      kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+      init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv),
+    );
+
     pc.onTrack = (RTCTrackEvent e) async {
       if (e.streams.isNotEmpty) {
         remoteRenderer.srcObject = e.streams.first;
@@ -415,7 +523,7 @@ class WebRTCEngine {
       _log('Remote track: ${e.track.kind}');
     };
 
-    pc.onDataChannel = (RTCDataChannel dc) {
+    pc.onDataChannel = (dc) {
       _dc = dc;
       _wireDataChannel();
       _log('DataChannel received: ${dc.label}');
@@ -442,7 +550,7 @@ class WebRTCEngine {
       _log('ICE state: $s');
       connected.value =
           (s == RTCIceConnectionState.RTCIceConnectionStateConnected ||
-              s == RTCIceConnectionState.RTCIceConnectionStateCompleted);
+           s == RTCIceConnectionState.RTCIceConnectionStateCompleted);
     };
     pc.onConnectionState = (s) => _log('PC state: $s');
   }
@@ -468,7 +576,7 @@ class WebRTCEngine {
   }
 
   Map<String, dynamic> _buildRtcConfig() {
-    // Нормализуем: по одной url на запись
+    // Нормализация: одна url на запись
     final norm = <Map<String, dynamic>>[];
     for (final s in [
       {'urls': 'stun:stun.l.google.com:19302'},
@@ -491,12 +599,14 @@ class WebRTCEngine {
     return {
       'iceServers': norm,
       'sdpSemantics': 'unified-plan',
-      'iceTransportPolicy': Env.forceRelay ? 'relay' : 'all', // диагностика
+      'iceTransportPolicy': Env.forceRelay ? 'relay' : 'all',
       'bundlePolicy': 'max-bundle',
       'rtcpMuxPolicy': 'require',
+      // 'iceCandidatePoolSize': 0, // можно включить при необходимости
     };
   }
 
+  /// Готовим локальные треки под текущие намерения (_intendMic/_intendCam)
   Future<void> _ensureLocalSendReady() async {
     if (_localStream == null && (_intendMic || _intendCam)) {
       _localStream = await createLocalMediaStream('local');
@@ -544,22 +654,21 @@ class WebRTCEngine {
     _log('Local tracks now => audio:${_localStream?.getAudioTracks().length ?? 0} '
         'video:${_localStream?.getVideoTracks().length ?? 0}');
 
+    // мобилам включаем громкую связь
     final isMobile = !kIsWeb &&
         (defaultTargetPlatform == TargetPlatform.android ||
-            defaultTargetPlatform == TargetPlatform.iOS);
+         defaultTargetPlatform == TargetPlatform.iOS);
     if (isMobile) {
       await Helper.setSpeakerphoneOn(true);
     }
   }
 
   void _wireDataChannel() {
-    _dc?.onMessage = (RTCDataChannelMessage msg) {
+    _dc?.onMessage = (msg) {
       _chatIn.add(msg.text);
       _log('Peer: ${msg.text}');
     };
-    _dc?.onDataChannelState = (state) {
-      _log('DataChannel: $state');
-    };
+    _dc?.onDataChannelState = (state) => _log('DataChannel: $state');
   }
 
   Future<void> _makeOffer() async {
@@ -573,7 +682,7 @@ class WebRTCEngine {
     _log('OFFER sent via WS to=$_remotePeerId');
   }
 
-  // Гарантировать наличие recvonly transceiver'ов под answer
+  /// Гарантировать наличие recvonly-транссиверов под answer
   Future<void> _ensureRecvTransceivers({bool force = false}) async {
     if (_pc == null) return;
 
@@ -609,18 +718,6 @@ class WebRTCEngine {
     }
   }
 
-  void forceRebindLocal() {
-    if (_localStream != null) {
-      localRenderer.srcObject = _localStream;
-    }
-  }
-
-  void forceRebindRemote() {
-    if (remoteRenderer.srcObject != null) {
-      remoteRenderer.srcObject = remoteRenderer.srcObject; // пинок рендереру
-    }
-  }
-
   Future<void> _closePeer() async {
     try { await _dc?.close(); } catch (_) {}
     _dc = null;
@@ -628,7 +725,7 @@ class WebRTCEngine {
     try { await _pc?.close(); } catch (_) {}
     _pc = null;
 
-    // выключим и отпустим треки
+    // останавливаем и освобождаем локальные треки/стрим
     try {
       final tracks = [
         ...(_localStream?.getAudioTracks() ?? const []),
@@ -646,17 +743,42 @@ class WebRTCEngine {
     _pendingIce.clear();
     _remoteSet = false;
 
-    // очистим превью, чтобы не ловить «зависшие» кадры
+    // очищаем рендереры
     localRenderer.srcObject = null;
     remoteRenderer.srcObject = null;
+
     micOn.value = false;
     camOn.value = false;
     muted.value = false;
   }
 
+  Future<void> _renegotiate(String reason) async {
+    if (_pc == null) return;
+    if (_negotiationInFlight) {
+      _log('Renegotiate skipped ($reason): in-flight');
+      return;
+    }
+    _negotiationInFlight = true;
+    try {
+      _log('Renegotiate: $reason');
+      final offer = await _pc!.createOffer({});
+      await _pc!.setLocalDescription(offer);
+      final local = await _pc!.getLocalDescription();
+      _sendWS({'type': 'offer', 'sdp': local!.sdp, 'to': _remotePeerId});
+      _log('OFFER (renegotiate) sent to=$_remotePeerId');
+    } catch (e) {
+      _log('Renegotiate error: $e');
+    } finally {
+      _negotiationInFlight = false;
+    }
+  }
+
+  // --------------------- утиль ---------------------
+
   String _genRoomId() {
     final rnd = Random();
     return rnd.nextInt(0x7FFFFFFF).toRadixString(16).padLeft(8, '0');
+    // можно заменить на любой другой генератор
   }
 
   String? _extractRoomId(String raw) {
@@ -670,5 +792,17 @@ class WebRTCEngine {
       return parts.isNotEmpty ? parts.last : null;
     }
     return r;
+  }
+
+  void forceRebindLocal() {
+    if (_localStream != null) {
+      localRenderer.srcObject = _localStream;
+    }
+  }
+
+  void forceRebindRemote() {
+    if (remoteRenderer.srcObject != null) {
+      remoteRenderer.srcObject = remoteRenderer.srcObject; // «пинок» рендереру
+    }
   }
 }
